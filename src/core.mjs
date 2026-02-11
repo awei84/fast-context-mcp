@@ -481,13 +481,17 @@ async function _unaryRequest(url, protoBytes, compress = true) {
   } catch (e) {
     // TLS or network error — try with cert verification disabled
     _applyTlsFallback();
-    resp = await doFetch();
+    try {
+      resp = await doFetch();
+    } catch (e2) {
+      throw _classifyError(e2);
+    }
   }
 
   if (!resp.ok) {
     const err = new Error(`HTTP ${resp.status}`);
     err.status = resp.status;
-    throw err;
+    throw _classifyError(err);
   }
 
   const arrayBuf = await resp.arrayBuffer();
