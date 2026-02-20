@@ -361,11 +361,11 @@ function getToolDefinitions(maxCommands = 8) {
 
 /**
  * Auto-discover Windsurf API key from local installation.
- * @returns {string|null}
+ * @returns {Promise<string|null>}
  */
-function autoDiscoverApiKey() {
+async function autoDiscoverApiKey() {
   try {
-    const result = extractKey();
+    const result = await extractKey();
     if (result.api_key && result.api_key.startsWith("sk-")) {
       return result.api_key;
     }
@@ -377,12 +377,12 @@ function autoDiscoverApiKey() {
 
 /**
  * Get API key from env var or auto-discovery.
- * @returns {string}
+ * @returns {Promise<string>}
  */
-function getApiKey() {
+async function getApiKey() {
   const key = process.env.WINDSURF_API_KEY;
   if (key) return key;
-  const discovered = autoDiscoverApiKey();
+  const discovered = await autoDiscoverApiKey();
   if (discovered) return discovered;
   throw new Error(
     "Windsurf API Key not found. Set WINDSURF_API_KEY env var or ensure Windsurf is logged in. " +
@@ -984,7 +984,7 @@ export async function search({
 
   // Get credentials
   if (!apiKey) {
-    apiKey = getApiKey();
+    apiKey = await getApiKey();
   }
   if (!jwt) {
     log("Fetching JWT...");
@@ -1199,8 +1199,8 @@ export async function searchWithContent({
 
 /**
  * Extract Windsurf API Key info (for MCP tool use).
- * @returns {Object}
+ * @returns {Promise<Object>}
  */
-export function extractKeyInfo() {
+export async function extractKeyInfo() {
   return extractKey();
 }

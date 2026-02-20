@@ -1,9 +1,17 @@
 {
   "name": "fast-context-mcp",
-  "version": "1.0.0",
-  "description": "AI-driven semantic code search via reverse-engineered Windsurf protocol (Node.js)",
+  "version": "1.1.0",
+  "description": "AI-driven semantic code search MCP server (Node.js)",
   "type": "module",
   "main": "src/server.mjs",
+  "bin": {
+    "fast-context-mcp": "src/server.mjs"
+  },
+  "files": [
+    "src/",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "start": "node src/server.mjs"
   },
@@ -13,7 +21,7 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
     "@vscode/ripgrep": "^1.15.9",
-    "better-sqlite3": "^11.0.0",
+    "sql.js": "^1.14.0",
     "tree-node-cli": "^1.6.0",
     "zod": "^3.23.0"
   },

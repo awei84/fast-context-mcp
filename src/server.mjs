@@ -174,7 +174,7 @@ server.tool(
     "Windsurf's local database. Set the result as WINDSURF_API_KEY env var.",
   {},
   async () => {
-    const result = extractKeyInfo();
+    const result = await extractKeyInfo();
 
     if (result.error) {
       const text = `Error: ${result.error}\n${result.hint || ""}\nDB path: ${result.db_path || "N/A"}`;
@@ -182,12 +182,10 @@ server.tool(
     }
 
     const key = result.api_key;
-    const method = result.method === "safeStorage" ? "safeStorage (encrypted)" : "legacy (plaintext)";
     const text =
       `Windsurf API Key extracted successfully\n\n` +
       `  Key: ${key.slice(0, 30)}...${key.slice(-10)}\n` +
       `  Length: ${key.length}\n` +
-      `  Method: ${method}\n` +
       `  Source: ${result.db_path}\n\n` +
       `Usage:\n` +
       `  export WINDSURF_API_KEY="${key}"`;
