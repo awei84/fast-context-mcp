@@ -12,7 +12,7 @@
  */
 
 import { readdirSync, existsSync, statSync } from "node:fs";
-import { resolve, join, relative } from "node:path";
+import { resolve, join, relative, sep } from "node:path";
 import { gzipSync } from "node:zlib";
 import { randomUUID } from "node:crypto";
 import { platform, arch, release, version as osVersion, hostname, cpus, totalmem } from "node:os";
@@ -933,7 +933,7 @@ function _parseAnswer(xmlText, projectRoot) {
 
     // Path safety: reject traversal attempts (../) and paths outside project root
     const fullPath = resolve(projectRoot, rel);
-    if (!fullPath.startsWith(resolvedRoot + "/") && fullPath !== resolvedRoot) {
+    if (!fullPath.startsWith(resolvedRoot + sep) && fullPath !== resolvedRoot) {
       continue;
     }
 

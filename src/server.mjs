@@ -182,10 +182,12 @@ server.tool(
     }
 
     const key = result.api_key;
+    const method = result.method === "safeStorage" ? "safeStorage (encrypted)" : "legacy (plaintext)";
     const text =
       `Windsurf API Key extracted successfully\n\n` +
       `  Key: ${key.slice(0, 30)}...${key.slice(-10)}\n` +
       `  Length: ${key.length}\n` +
+      `  Method: ${method}\n` +
       `  Source: ${result.db_path}\n\n` +
       `Usage:\n` +
       `  export WINDSURF_API_KEY="${key}"`;
