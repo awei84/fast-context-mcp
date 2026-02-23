@@ -925,11 +925,12 @@ function getRepoMap(projectRoot, targetDepth = 3, excludePaths = []) {
 function _parseAnswer(xmlText, projectRoot) {
   const files = [];
   const resolvedRoot = resolve(projectRoot);
-  const fileRegex = /<file\s+path="([^"]+)">([\s\S]*?)<\/file>/g;
+  const fileRegex = /<file\s+path=(["'])([^"']+)\1>([\s\S]*?)<\/file>/g;
   let fm;
   while ((fm = fileRegex.exec(xmlText)) !== null) {
-    const vpath = fm[1];
-    const rel = vpath.replace(/^\/codebase\/?/, "");
+    const vpath = fm[2];
+    let rel = vpath.replace(/^\/codebase[\/\\]?/, "");
+    rel = rel.replace(/^[\/\\]+/, "");
 
     // Path safety: reject traversal attempts (../) and paths outside project root
     const fullPath = resolve(projectRoot, rel);
@@ -940,7 +941,7 @@ function _parseAnswer(xmlText, projectRoot) {
     const ranges = [];
     const rangeRegex = /<range>(\d+)-(\d+)<\/range>/g;
     let rm;
-    while ((rm = rangeRegex.exec(fm[2])) !== null) {
+    while ((rm = rangeRegex.exec(fm[3])) !== null) {
       ranges.push([parseInt(rm[1], 10), parseInt(rm[2], 10)]);
     }
 
