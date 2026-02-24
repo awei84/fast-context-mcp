@@ -409,6 +409,9 @@ export class ToolExecutor {
    * @returns {Promise<string>}
    */
   async execCommandAsync(cmd) {
+    if (!cmd || typeof cmd !== "object") {
+      return "Error: missing or invalid command";
+    }
     const t = cmd.type || "";
     switch (t) {
       case "rg":
@@ -432,6 +435,9 @@ export class ToolExecutor {
    * @returns {string}
    */
   execCommand(cmd) {
+    if (!cmd || typeof cmd !== "object") {
+      return "Error: missing or invalid command";
+    }
     const t = cmd.type || "";
     switch (t) {
       case "rg":
@@ -455,13 +461,14 @@ export class ToolExecutor {
    * @returns {Promise<string>}
    */
   async execToolCallAsync(args) {
+    if (!args || typeof args !== "object") {
+      return "Error: missing or invalid tool args";
+    }
     const keys = Object.keys(args).filter((k) => k.startsWith("command")).sort();
-    const tasks = keys
-      .filter((key) => typeof args[key] === "object")
-      .map(async (key) => {
-        const output = await this.execCommandAsync(args[key]);
-        return `<${key}_result>\n${output}\n</${key}_result>`;
-      });
+    const tasks = keys.map(async (key) => {
+      const output = await this.execCommandAsync(args[key]);
+      return `<${key}_result>\n${output}\n</${key}_result>`;
+    });
     const results = await Promise.all(tasks);
     return results.join("");
   }
@@ -473,12 +480,13 @@ export class ToolExecutor {
    */
   execToolCall(args) {
     const parts = [];
+    if (!args || typeof args !== "object") {
+      return "Error: missing or invalid tool args";
+    }
     const keys = Object.keys(args).filter((k) => k.startsWith("command")).sort();
     for (const key of keys) {
-      if (typeof args[key] === "object") {
-        const output = this.execCommand(args[key]);
-        parts.push(`<${key}_result>\n${output}\n</${key}_result>`);
-      }
+      const output = this.execCommand(args[key]);
+      parts.push(`<${key}_result>\n${output}\n</${key}_result>`);
     }
     return parts.join("");
   }
