@@ -1014,8 +1014,9 @@ export async function search({
 
   // Total API calls = maxTurns + 1 (last round for answer)
   const totalApiCalls = maxTurns + 1;
+  let compensatedTurns = 0;
 
-  for (let turn = 0; turn < totalApiCalls; turn++) {
+  for (let turn = 0; turn < totalApiCalls + compensatedTurns; turn++) {
     log(`Turn ${turn + 1}/${totalApiCalls}`);
 
     const proto = _buildRequest(apiKey, jwt, messages, toolDefs);
@@ -1076,6 +1077,16 @@ export async function search({
 
       const cmds = Object.keys(toolArgs).filter((k) => k.startsWith("command"));
       log(`Executing ${cmds.length} local commands`);
+
+      // Check for valid commands (those with a type field)
+      const validCommands = cmds.filter((k) => {
+        const cmd = toolArgs[k];
+        return cmd && typeof cmd === "object" && cmd.type;
+      });
+      if (validCommands.length === 0) {
+        compensatedTurns++;
+        log("Turn compensation: no valid commands, extending search by 1 turn");
+      }
 
       const results = await executor.execToolCallAsync(toolArgs);
 
