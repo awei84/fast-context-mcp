@@ -23,3 +23,16 @@
 ### 子代理使用条件
 
 仅当需要读取 10+ 文件交叉比对、或多轮搜索会撑爆上下文时，才启动子代理。
+
+### npm 发布
+
+发布新版本时，需要同时发布两个包：
+- `fast-context-mcp`
+- `fast-cxt-mcp`
+
+发布流程：
+1. `npm version patch` 升级版本
+2. `npm publish --access public` 发布 fast-context-mcp
+3. 临时修改 package.json 的 name 为 `fast-cxt-mcp`
+4. `npm publish --access public` 发布 fast-cxt-mcp
+5. 恢复 package.json 的 name 为 `fast-context-mcp`
