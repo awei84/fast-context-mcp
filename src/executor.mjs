@@ -36,6 +36,17 @@ function readIntEnv(name, defaultValue, opts = {}) {
 const RESULT_MAX_LINES = readIntEnv("FC_RESULT_MAX_LINES", 50, { min: 1, max: 500 });
 const LINE_MAX_CHARS = readIntEnv("FC_LINE_MAX_CHARS", 250, { min: 20, max: 10000 });
 
+function expandExcludeGlobs(pattern) {
+  if (typeof pattern !== "string") return [];
+  const normalized = pattern.trim().replace(/\\/g, "/");
+  if (!normalized) return [];
+  const expanded = [normalized];
+  if (!normalized.startsWith("**/") && !normalized.startsWith("/")) {
+    expanded.push(`**/${normalized}`);
+  }
+  return [...new Set(expanded)];
+}
+
 export class ToolExecutor {
   /**
    * @param {string} projectRoot
@@ -90,8 +101,13 @@ export class ToolExecutor {
    * @returns {string}
    */
   _remap(text) {
-    // Replace both forward-slash and native-sep versions
-    return text.replaceAll(this.root, "/codebase");
+    // Replace both forward-slash and native-sep (Windows \) versions of root path
+    let result = text.replaceAll(this.root, "/codebase");
+    if (sep === "\\") {
+      // Windows: resolve() returns backslash paths, but rg output may use either
+      result = result.replaceAll(this.root.replaceAll("\\", "/"), "/codebase");
+    }
+    return result;
   }
 
   /**
@@ -138,7 +154,7 @@ export class ToolExecutor {
       return `Error: path does not exist: ${path}`;
     }
 
-    const args = ["--no-heading", "-n", "--max-count", "50", pattern, rp];
+    const args = ["--no-heading", "-n", "--max-count", "50"];
     if (include) {
       for (const g of include) {
         args.push("--glob", g);
@@ -146,9 +162,12 @@ export class ToolExecutor {
     }
     if (exclude) {
       for (const g of exclude) {
-        args.push("--glob", `!${g}`);
+        for (const ex of expandExcludeGlobs(g)) {
+          args.push("--glob", `!${ex}`);
+        }
       }
     }
+    args.push("--", pattern, rp);
 
     try {
       const { stdout } = await execFileAsync(rgPath, args, {
@@ -190,7 +209,7 @@ export class ToolExecutor {
       return `Error: path does not exist: ${path}`;
     }
 
-    const args = ["--no-heading", "-n", "--max-count", "50", pattern, rp];
+    const args = ["--no-heading", "-n", "--max-count", "50"];
     if (include) {
       for (const g of include) {
         args.push("--glob", g);
@@ -198,9 +217,12 @@ export class ToolExecutor {
     }
     if (exclude) {
       for (const g of exclude) {
-        args.push("--glob", `!${g}`);
+        for (const ex of expandExcludeGlobs(g)) {
+          args.push("--glob", `!${ex}`);
+        }
       }
     }
+    args.push("--", pattern, rp);
 
     try {
       const stdout = execFileSync(rgPath, args, {
@@ -292,7 +314,7 @@ export class ToolExecutor {
       //    basename as the first line (e.g. "supabase"), which _remap won't
       //    catch since it's not the full absolute path. Replace with the
       //    virtual path the AI requested (already /codebase/...).
-      const dirName = rp.split("/").pop() || rp.split("\\").pop() || rp;
+      const dirName = basename(rp);
       const lines = stdout.split("\n");
       if (lines[0] === dirName) {
         lines[0] = path;

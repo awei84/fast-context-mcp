@@ -11,8 +11,9 @@
  *   → ANSWER: file paths + line ranges + suggested rg patterns
  */
 
-import { readdirSync, existsSync, statSync } from "node:fs";
-import { resolve, join, relative, sep, isAbsolute } from "node:path";
+import { readdirSync, existsSync, statSync, readFileSync } from "node:fs";
+import { resolve, join, relative, sep, isAbsolute, extname } from "node:path";
+import { execFileSync } from "node:child_process";
 import { gzipSync } from "node:zlib";
 import { randomUUID } from "node:crypto";
 import { platform, arch, release, version as osVersion, hostname, cpus, totalmem } from "node:os";
@@ -25,6 +26,7 @@ import {
   connectFrameDecode,
 } from "./protobuf.mjs";
 import { ToolExecutor } from "./executor.mjs";
+import { rgPath } from "@vscode/ripgrep";
 import { extractKey } from "./extract-key.mjs";
 import { scoreDirectories, tokenize as tokenizeBM25 } from "./directory-scorer.mjs";
 
@@ -83,17 +85,37 @@ const WS_LS_VER = process.env.WS_LS_VER || "1.9544.35";
 const WS_MODEL = process.env.WS_MODEL || "MODEL_SWE_1_6_FAST";
 const DEBUG_MODE = process.env.FAST_CONTEXT_DEBUG === "1" || process.env.FAST_CONTEXT_DEBUG === "true";
 
-// Default excludes aligned with Windsurf fast-search guidance.
-// Minimal defaults — only dirs that are almost never source code.
-// Users can add more via the exclude_paths parameter.
+// Default excludes — directories/patterns that are almost never source code.
+// Aligned with Windsurf fast-search guidance + ace-tool-rs defaults.
+// Users can add more via the exclude_paths parameter; these are always applied.
 const DEFAULT_EXCLUDE_PATHS = [
+  // 依赖目录
   "node_modules",
-  ".git",
-  "__pycache__",
+  "vendor",
   ".venv",
   "venv",
+  // 版本控制
+  ".git",
+  ".svn",
+  ".hg",
+  // 构建输出
   "dist",
+  "build",
+  "out",
+  "target",
+  ".next",
+  ".nuxt",
+  ".output",
+  // 缓存
+  "__pycache__",
+  ".cache",
+  ".pytest_cache",
+  // 压缩/混淆产物
   "*.min.*",
+  // 常见无关目录
+  "coverage",
+  ".idea",
+  ".vscode",
 ];
 
 // Repo-map optimization defaults (tunable via MCP params).
@@ -113,6 +135,17 @@ function _mergeExcludePaths(excludePaths = []) {
     }
   }
   return merged;
+}
+
+function _expandExcludeGlobsForRg(pattern) {
+  if (typeof pattern !== "string") return [];
+  const normalized = pattern.trim().replace(/\\/g, "/");
+  if (!normalized) return [];
+  const expanded = [normalized];
+  if (!normalized.startsWith("**/") && !normalized.startsWith("/")) {
+    expanded.push(`**/${normalized}`);
+  }
+  return [...new Set(expanded)];
 }
 
 // ─── System Prompt Template ────────────────────────────────
@@ -1316,7 +1349,9 @@ function buildOptimizedRepoMap({
 
   const bootstrapDepth = Math.max(1, Math.min(3, Number(cfg.bootstrapTreeDepth) || 1));
   const hotspotTopK = Math.max(0, Math.min(8, Number(cfg.hotspotTopK) || 4));
-  const hotspotTreeDepth = Math.max(1, Math.min(4, Number(cfg.hotspotTreeDepth) || 2));
+  const cfgHotspotDepth = Math.max(1, Math.min(4, Number(cfg.hotspotTreeDepth) || 2));
+  // 用户的 treeDepth 提升 hotspot subtree 深度，避免参数被静默忽略
+  const hotspotTreeDepth = treeDepth > cfgHotspotDepth ? Math.min(4, treeDepth) : cfgHotspotDepth;
   const maxBytes = Math.max(16 * 1024, Number(cfg.maxBytes) || REPO_MAP_OPTIMIZER_DEFAULTS.maxBytes);
 
   const bootstrap = getRepoMap(projectRoot, bootstrapDepth, excludePaths);
@@ -1411,6 +1446,7 @@ function buildOptimizedRepoMap({
   return {
     tree,
     depth: bootstrap.depth,
+    hotspotDepth: hotspotTreeDepth,
     sizeBytes: Buffer.byteLength(tree, "utf-8"),
     fellBack: bootstrap.fellBack,
     autoDepth: bootstrap.autoDepth,
@@ -1532,7 +1568,7 @@ export async function search({
     log(`Bootstrap hints: patterns=${bootstrapHints.rgPatterns.length}, hot_dirs=${bootstrapHints.hotDirs.length}`);
   }
 
-  const { tree: repoMap, depth: actualDepth, sizeBytes: treeSizeBytes, fellBack, autoDepth, strategy: repoMapStrategy, hotDirs = [] } = buildOptimizedRepoMap({
+  const { tree: repoMap, depth: actualDepth, hotspotDepth: actualHotspotDepth, sizeBytes: treeSizeBytes, fellBack, autoDepth, strategy: repoMapStrategy, hotDirs = [] } = buildOptimizedRepoMap({
     query,
     projectRoot,
     treeDepth,
@@ -1601,6 +1637,7 @@ export async function search({
       const errCode = e.code || "UNKNOWN";
       const baseMeta = {
         treeDepth: actualDepth,
+        hotspotDepth: actualHotspotDepth,
         treeSizeKB: +(treeSizeBytes / 1024).toFixed(1),
         fellBack,
         projectRoot,
@@ -1659,6 +1696,7 @@ export async function search({
       result.rg_patterns = [...new Set(executor.collectedRgPatterns)];
       result._meta = {
         treeDepth: actualDepth,
+        hotspotDepth: actualHotspotDepth,
         treeSizeKB: +(treeSizeBytes / 1024).toFixed(1),
         fellBack,
         repoMapStrategy,
@@ -1764,6 +1802,7 @@ export async function search({
     rg_patterns: [...new Set(executor.collectedRgPatterns)],
     _meta: {
       treeDepth: actualDepth,
+      hotspotDepth: actualHotspotDepth,
       treeSizeKB: +(treeSizeBytes / 1024).toFixed(1),
       fellBack,
       projectRoot,
@@ -1771,6 +1810,180 @@ export async function search({
       hotDirs,
     },
   };
+}
+
+// ─── Grep Keyword Expansion ────────────────────────────────
+
+// 噪音文件排除规则：打包产物、依赖文件、自动生成物、二进制、AI 配置等
+// 参考来源：ace-tool-rs (Augment 逆向) 默认排除列表 + 实测反馈
+const GREP_NOISE_GLOBS = [
+  // 打包产物 & sourcemap
+  "chunk-*", "*.chunk.*", "*.bundle.*",
+  "*.min.js", "*.min.css", "*.map",
+  "app.*.js", "app.*.css",              // Vue/Webpack hash-named bundles
+  // 依赖 & 锁定文件
+  "*.lock", "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
+  "go.sum", "go.mod",                   // Go 依赖
+  "Cargo.lock",                         // Rust 依赖
+  // 自动生成的类型声明
+  "*.d.ts",
+  // 二进制文件（来自 ace-tool-rs）
+  "*.exe", "*.dll", "*.so", "*.dylib",  // 平台二进制
+  "*.pyc", "*.pyo", "*.class",          // 编译中间物
+  "*.wasm", "*.o", "*.a",               // 编译产物
+  // 静态资源 & 媒体文件（来自 ace-tool-rs）
+  "*.svg", "*.png", "*.jpg", "*.jpeg", "*.gif", "*.ico", "*.webp",
+  "*.woff*", "*.ttf", "*.eot", "*.otf",
+  "*.mp4", "*.mp3", "*.wav", "*.avi", "*.mov",  // 音视频
+  "*.pdf", "*.doc", "*.docx", "*.xls", "*.xlsx", // 文档
+  "*.zip", "*.tar", "*.gz", "*.rar", "*.7z",     // 压缩包
+  // AI 配置文件（grep 扩展中属于噪音）
+  "CLAUDE.md", "AGENTS.md", ".cursorrules", ".cursorignore",
+];
+
+// 整目录排除：构建输出、缓存、VCS、依赖目录
+// 参考来源：ace-tool-rs 默认排除 + 实测反馈
+const GREP_NOISE_DIR_GLOBS = [
+  // 构建输出
+  "dist/**", "build/**", "out/**", "target/**",
+  "resource/page/**",                   // 静态资源目录
+  // 框架构建缓存
+  ".nuxt/**", ".next/**", ".output/**",
+  // 缓存目录（来自 ace-tool-rs）
+  "__pycache__/**", ".cache/**", ".pytest_cache/**",
+  // 版本控制（来自 ace-tool-rs）
+  ".svn/**", ".hg/**",
+  // 依赖目录（来自 ace-tool-rs）
+  "vendor/**", ".venv/**", "venv/**",
+];
+
+/**
+ * 自动执行 grep keywords 查找额外匹配文件，补充远端模型的遗漏。
+ * 纯本地操作，0 API 调用。
+ * @param {number} maxPerPattern - 每个 pattern 最多补充的文件数
+ * @param {number} maxTotal - grep 扩展的总文件数上限（避免输出过大）
+ */
+function _autoGrepFiles(patterns, projectRoot, excludePaths, existingPaths, maxPerPattern = 3, maxTotal = 10) {
+  // hitCount 记录每个文件被多少个 pattern 命中，用于后续排序
+  const hitCount = new Map(); // resolve(path) -> count
+  const fileInfo = new Map(); // resolve(path) -> { path, full_path }
+  const seen = new Set(existingPaths.map((p) => resolve(projectRoot, p)));
+
+  // 构建噪音 glob 参数（文件级 + 目录级）
+  const noiseArgs = [];
+  for (const noise of GREP_NOISE_GLOBS) {
+    noiseArgs.push("--glob", `!${noise}`);
+  }
+  for (const noise of GREP_NOISE_DIR_GLOBS) {
+    noiseArgs.push("--glob", `!${noise}`);
+  }
+
+  for (const pattern of patterns.slice(0, 8)) {
+    // 总数已达上限，提前退出节省 rg 调用
+    if (fileInfo.size >= maxTotal) break;
+
+    try {
+      const args = ["-l", "--max-count", "10", "-S"];
+      for (const ex of excludePaths) {
+        for (const expanded of _expandExcludeGlobsForRg(ex)) {
+          args.push("--glob", `!${expanded}`);
+        }
+      }
+      args.push(...noiseArgs);
+      args.push("--", pattern, projectRoot);
+      const stdout = execFileSync(rgPath, args, {
+        timeout: 5000,
+        maxBuffer: 1024 * 1024,
+        encoding: "utf-8",
+      });
+      const files = stdout.trim().split("\n").filter(Boolean);
+      let added = 0;
+      for (const f of files) {
+        if (added >= maxPerPattern) break;
+        const full = resolve(f);
+        if (seen.has(full)) continue;
+        const rel = relative(projectRoot, full);
+        if (rel.startsWith("..") || isAbsolute(rel)) continue;
+
+        // 记录命中次数
+        hitCount.set(full, (hitCount.get(full) || 0) + 1);
+        if (!fileInfo.has(full)) {
+          fileInfo.set(full, { path: rel, full_path: full, ranges: [], fromGrep: true });
+          added++;
+          if (fileInfo.size >= maxTotal) break;
+        }
+      }
+    } catch {
+      // rg 返回 1 表示无匹配，正常忽略
+    }
+  }
+
+  // 按匹配 pattern 数降序排序，再截取 maxTotal
+  const found = [...fileInfo.values()]
+    .sort((a, b) => {
+      return (hitCount.get(resolve(b.full_path)) || 0) - (hitCount.get(resolve(a.full_path)) || 0);
+    })
+    .slice(0, maxTotal);
+  return found;
+}
+
+// ─── Code Snippet Reader ───────────────────────────────────
+
+const EXT_LANG_MAP = {
+  ".js": "javascript", ".mjs": "javascript", ".cjs": "javascript",
+  ".ts": "typescript", ".tsx": "typescript", ".jsx": "javascript",
+  ".py": "python", ".go": "go", ".rs": "rust", ".java": "java",
+  ".rb": "ruby", ".vue": "vue", ".c": "c", ".h": "c",
+  ".cpp": "cpp", ".hpp": "cpp", ".cs": "csharp", ".php": "php",
+  ".swift": "swift", ".kt": "kotlin", ".sh": "bash",
+  ".yaml": "yaml", ".yml": "yaml", ".json": "json", ".toml": "toml",
+  ".sql": "sql", ".html": "html", ".css": "css", ".scss": "scss",
+};
+
+/**
+ * 读取文件指定行范围的代码片段。
+ * @param {string} filePath - 文件绝对路径
+ * @param {Array<[number, number]>} ranges - 行范围列表 (1-indexed, inclusive)
+ * @param {number} budget - 剩余字符预算
+ * @returns {{ snippets: string[], used: number }}
+ */
+function _readCodeSnippets(filePath, ranges, budget) {
+  const snippets = [];
+  let used = 0;
+  const lang = EXT_LANG_MAP[extname(filePath).toLowerCase()] || "";
+
+  try {
+    const content = readFileSync(filePath, "utf-8");
+    const lines = content.split("\n");
+
+    // 如果没有 ranges（grep 扩展来的），取前 20 行
+    const effectiveRanges = ranges.length > 0 ? ranges : [[1, Math.min(20, lines.length)]];
+
+    for (const [start, end] of effectiveRanges) {
+      const s = Math.max(1, start) - 1;
+      const e = Math.min(lines.length, end);
+      const slice = lines.slice(s, e);
+      const snippet = slice.map((l, i) => `${String(s + i + 1).padStart(4)} | ${l}`).join("\n");
+      const block = `\`\`\`${lang}\n${snippet}\n\`\`\``;
+
+      if (used + block.length > budget) {
+        // 预算不足，截断当前 snippet
+        const remaining = budget - used - 100; // 留 100 字符给截断提示
+        if (remaining > 200) {
+          const truncated = block.slice(0, remaining) + "\n... [truncated]```";
+          snippets.push(truncated);
+          used += truncated.length;
+        }
+        return { snippets, used };
+      }
+
+      snippets.push(block);
+      used += block.length;
+    }
+  } catch {
+    // 文件读取失败，跳过
+  }
+  return { snippets, used };
 }
 
 /**
@@ -1806,6 +2019,7 @@ export async function searchWithContent({
   bootstrapEnabled = true,
   bootstrapMaxTurns = 2,
   bootstrapMaxCommands = 6,
+  includeSnippets = false,
 }) {
   const result = await search({
     query,
@@ -1851,10 +2065,32 @@ export async function searchWithContent({
     return errMsg;
   }
 
-  const files = result.files || [];
+  let files = result.files || [];
+  if (files.length > maxResults) {
+    files = files.slice(0, maxResults);
+  }
   const rgPatterns = result.rg_patterns || [];
   // Deduplicate + filter short patterns
   const uniquePatterns = [...new Set(rgPatterns)].filter((p) => p.length >= 3);
+
+  // B: 自动执行 grep keywords 补充遗漏文件（纯本地，0 API 调用）
+  let grepExpanded = 0;
+  const grepBudget = Math.max(0, maxResults - files.length);
+  if (uniquePatterns.length > 0 && grepBudget > 0) {
+    const effectiveExcludePaths = _mergeExcludePaths(excludePaths);
+    const extra = _autoGrepFiles(
+      uniquePatterns,
+      projectRoot,
+      effectiveExcludePaths,
+      files.map((f) => f.path),
+      3,
+      grepBudget,
+    );
+    if (extra.length > 0) {
+      files = [...files, ...extra];
+      grepExpanded = extra.length;
+    }
+  }
 
   if (!files.length && !uniquePatterns.length) {
     const raw = result.raw_response || "";
@@ -1868,15 +2104,40 @@ export async function searchWithContent({
   const n = files.length;
 
   if (files.length) {
-    parts.push(`Found ${n} relevant files.`);
-    parts.push("");
-    for (let i = 0; i < files.length; i++) {
-      const entry = files[i];
-      const rangesStr = entry.ranges.map(([s, e]) => `L${s}-${e}`).join(", ");
-      parts.push(`  [${i + 1}/${n}] ${entry.full_path} (${rangesStr})`);
-    }
+    const summary = grepExpanded > 0
+      ? `Found ${n} relevant files (${n - grepExpanded} from AI search, ${grepExpanded} from grep keyword expansion).`
+      : `Found ${n} relevant files.`;
+    parts.push(summary);
   } else {
     parts.push("No files found.");
+  }
+
+  // C: 附带代码片段，让单次调用就能提供完整上下文
+  // 45KB 代码预算 + ~5KB metadata = 控制总输出 ≤50KB
+  // 文件顺序：AI 找到的在前，grep 扩展的（按 pattern 命中数排序）在后
+  const CODE_BUDGET = 45000;
+  let codeBudgetLeft = CODE_BUDGET;
+
+  for (let i = 0; i < files.length; i++) {
+    const entry = files[i];
+    const rangesStr = entry.ranges.length > 0
+      ? entry.ranges.map(([s, e]) => `L${s}-${e}`).join(", ")
+      : (entry.fromGrep ? "grep match" : "");
+    const label = entry.fromGrep ? " [grep expanded]" : "";
+
+    parts.push("");
+    parts.push(`--- [${i + 1}/${n}] ${entry.full_path} (${rangesStr})${label} ---`);
+
+    // 仅在 includeSnippets=true 时读取并附带代码片段
+    if (includeSnippets && codeBudgetLeft > 200) {
+      const { snippets, used } = _readCodeSnippets(entry.full_path, entry.ranges, codeBudgetLeft);
+      for (const s of snippets) {
+        parts.push(s);
+      }
+      codeBudgetLeft -= used;
+    } else if (includeSnippets) {
+      parts.push("(code snippet omitted — output budget reached)");
+    }
   }
 
   if (uniquePatterns.length) {
@@ -1889,8 +2150,10 @@ export async function searchWithContent({
   if (meta) {
     const fbNote = meta.fellBack ? ` (fell back from requested depth)` : "";
     parts.push("");
-    let configLine = `[config] tree_depth=${meta.treeDepth}${fbNote}, tree_size=${meta.treeSizeKB}KB, max_turns=${maxTurns}, max_results=${maxResults}, timeout_ms=${timeoutMs}`;
+    const hotspotNote = meta.hotspotDepth ? `, hotspot_depth=${meta.hotspotDepth}` : "";
+    let configLine = `[config] tree_depth=${meta.treeDepth}${fbNote}${hotspotNote}, tree_size=${meta.treeSizeKB}KB, max_turns=${maxTurns}, max_results=${maxResults}, timeout_ms=${timeoutMs}`;
     if (excludePaths.length) configLine += `, exclude_paths=[${excludePaths.join(", ")}]`;
+    if (grepExpanded > 0) configLine += `, grep_expanded=${grepExpanded}`;
     parts.push(configLine);
   }
 

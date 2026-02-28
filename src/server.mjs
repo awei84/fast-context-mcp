@@ -68,10 +68,13 @@ const DEFAULT_HOTSPOT_MAX_BYTES = readIntEnv("FC_HOTSPOT_MAX_BYTES", 122880, { m
 const DEFAULT_BOOTSTRAP_ENABLED = readBoolEnv("FC_BOOTSTRAP_ENABLED", true);
 const DEFAULT_BOOTSTRAP_MAX_TURNS = readIntEnv("FC_BOOTSTRAP_MAX_TURNS", 2, { min: 1, max: 3 });
 const DEFAULT_BOOTSTRAP_MAX_COMMANDS = readIntEnv("FC_BOOTSTRAP_MAX_COMMANDS", 6, { min: 1, max: 8 });
+const DEFAULT_INCLUDE_SNIPPETS = readBoolEnv("FC_INCLUDE_SNIPPETS", false);
+// 检测环境变量是否被显式设置（用于调整 AI 提示词）
+const FC_SNIPPETS_EXPLICITLY_SET = process.env.FC_INCLUDE_SNIPPETS != null;
 
 const server = new McpServer({
   name: "windsurf-fast-context",
-  version: "1.1.6",
+  version: "1.2.1",
   instructions:
     "Windsurf Fast Context — AI-driven semantic code search. " +
     "Returns file paths with line ranges and grep keywords.\n" +
@@ -109,7 +112,11 @@ server.tool(
   "- max_turns: Controls how many search-execute-feedback rounds the remote AI gets. " +
   "If results are incomplete or the AI didn't find enough files, INCREASE this value. " +
   "If you want a quick rough answer, use 1.\n" +
-  "Response includes a [config] line showing actual parameters used — use this to decide adjustments on retry.",
+  (FC_SNIPPETS_EXPLICITLY_SET
+    ? `- include_code_snippets: Server-configured default is ${DEFAULT_INCLUDE_SNIPPETS}. Do NOT override unless explicitly asked by the user.\n`
+    : "- include_code_snippets: Default false (lightweight mode, ~2-5KB output). " +
+    "Set to true to include full code snippets in the response (~45KB output).\n") +
+  "Response includes a [config] line showing actual parameters used \u2014 use this to decide adjustments on retry.",
   {
     query: z.string().describe(
       'Natural language search query (e.g. "where is auth handled", "database connection pool")'
@@ -213,6 +220,18 @@ server.tool(
       .max(8)
       .default(DEFAULT_BOOTSTRAP_MAX_COMMANDS)
       .describe("Max commands per turn for bootstrap phase."),
+    include_code_snippets: z
+      .boolean()
+      .default(DEFAULT_INCLUDE_SNIPPETS)
+      .describe(
+        FC_SNIPPETS_EXPLICITLY_SET
+          ? `Include full code snippets in the response. ` +
+          `Server default: ${DEFAULT_INCLUDE_SNIPPETS} (configured via FC_INCLUDE_SNIPPETS env var). ` +
+          `Do NOT override this value unless the user explicitly asks for a different mode.`
+          : `Include full code snippets in the response. ` +
+          `Default false (lightweight mode: file paths + line ranges + grep keywords, ~2-5KB output). ` +
+          `Set to true for full code context (~45KB output).`
+      ),
   },
   async ({
     query,
@@ -229,6 +248,7 @@ server.tool(
     bootstrap_enabled,
     bootstrap_max_turns,
     bootstrap_max_commands,
+    include_code_snippets,
   }) => {
     let projectPath = project_path || process.cwd();
 
@@ -259,6 +279,7 @@ server.tool(
         bootstrapEnabled: bootstrap_enabled,
         bootstrapMaxTurns: bootstrap_max_turns,
         bootstrapMaxCommands: bootstrap_max_commands,
+        includeSnippets: include_code_snippets,
       });
       return { content: [{ type: "text", text: result }] };
     } catch (e) {
