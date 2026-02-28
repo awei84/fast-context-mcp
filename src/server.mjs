@@ -71,7 +71,7 @@ const DEFAULT_BOOTSTRAP_MAX_COMMANDS = readIntEnv("FC_BOOTSTRAP_MAX_COMMANDS", 6
 
 const server = new McpServer({
   name: "windsurf-fast-context",
-  version: "1.2.0",
+  version: "1.1.6",
   instructions:
     "Windsurf Fast Context — AI-driven semantic code search. " +
     "Returns file paths with line ranges and grep keywords.\n" +
