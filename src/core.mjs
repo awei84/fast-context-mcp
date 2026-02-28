@@ -26,6 +26,7 @@ import {
 } from "./protobuf.mjs";
 import { ToolExecutor } from "./executor.mjs";
 import { extractKey } from "./extract-key.mjs";
+import { scoreDirectories, tokenize as tokenizeBM25 } from "./directory-scorer.mjs";
 
 // ─── Error Classification ──────────────────────────────────
 
@@ -81,6 +82,38 @@ const WS_APP_VER = process.env.WS_APP_VER || "1.48.2";
 const WS_LS_VER = process.env.WS_LS_VER || "1.9544.35";
 const WS_MODEL = process.env.WS_MODEL || "MODEL_SWE_1_6_FAST";
 const DEBUG_MODE = process.env.FAST_CONTEXT_DEBUG === "1" || process.env.FAST_CONTEXT_DEBUG === "true";
+
+// Default excludes aligned with Windsurf fast-search guidance.
+// Minimal defaults — only dirs that are almost never source code.
+// Users can add more via the exclude_paths parameter.
+const DEFAULT_EXCLUDE_PATHS = [
+  "node_modules",
+  ".git",
+  "__pycache__",
+  ".venv",
+  "venv",
+  "dist",
+  "*.min.*",
+];
+
+// Repo-map optimization defaults (tunable via MCP params).
+const REPO_MAP_OPTIMIZER_DEFAULTS = {
+  mode: "bootstrap_hotspot", // classic | bootstrap_hotspot
+  bootstrapTreeDepth: 1,
+  hotspotTopK: 4,
+  hotspotTreeDepth: 2,
+  maxBytes: 120 * 1024,
+};
+
+function _mergeExcludePaths(excludePaths = []) {
+  const merged = [...DEFAULT_EXCLUDE_PATHS];
+  for (const p of excludePaths || []) {
+    if (typeof p === "string" && p && !merged.includes(p)) {
+      merged.push(p);
+    }
+  }
+  return merged;
+}
 
 // ─── System Prompt Template ────────────────────────────────
 
@@ -240,6 +273,26 @@ relevant files first. If fewer files are relevant, return fewer.
 const FINAL_FORCE_ANSWER =
   "You have no turns left. Now you MUST provide your final ANSWER, even if it's not complete.";
 
+const BOOTSTRAP_PROMPT_TEMPLATE = `You are a bootstrap planning agent for codebase hotspot discovery.
+Your ONLY goal is to discover high-signal search keywords and hotspot directories for a later full search phase.
+
+# OUTPUT CONTRACT
+- Use the restricted_exec tool ONLY.
+- Prefer rg + tree commands. Avoid deep readfile unless absolutely necessary.
+- Do NOT output final <ANSWER> for code fixes in this phase.
+- Keep commands focused and broad enough to identify likely relevant modules quickly.
+
+# TOOL BUDGET
+- You have at most {max_turns} turns.
+- You may use up to {max_commands} commands per turn.
+
+# STRATEGY
+1) Start from the provided mini repo map.
+2) Use targeted rg patterns derived from the user problem.
+3) Use tree on likely top-level directories to identify hotspots.
+4) Stop once you have enough keyword and hotspot coverage for phase-2.
+`;
+
 /**
  * Smart trim accumulated messages to reduce payload size.
  *
@@ -394,6 +447,101 @@ function buildSystemPrompt(maxTurns = 3, maxCommands = 8, maxResults = 10) {
     .replaceAll("{max_turns}", String(maxTurns))
     .replaceAll("{max_commands}", String(maxCommands))
     .replaceAll("{max_results}", String(maxResults));
+}
+
+function buildBootstrapPrompt(maxTurns = 2, maxCommands = 6) {
+  return BOOTSTRAP_PROMPT_TEMPLATE
+    .replaceAll("{max_turns}", String(maxTurns))
+    .replaceAll("{max_commands}", String(maxCommands));
+}
+
+function _extractTopDirFromCodebasePath(path = "") {
+  const p = String(path || "").replace(/\\/g, "/");
+  if (!p.startsWith("/codebase")) return null;
+  const rel = p.replace(/^\/codebase\/?/, "");
+  if (!rel) return null;
+  return rel.split("/")[0] || null;
+}
+
+async function _runBootstrapPhase({
+  query,
+  projectRoot,
+  apiKey,
+  jwt,
+  timeoutMs,
+  excludePaths,
+  bootstrapTreeDepth,
+  bootstrapMaxTurns,
+  bootstrapMaxCommands,
+  onProgress,
+}) {
+  const log = (msg) => onProgress?.(`[bootstrap] ${msg}`);
+  const hints = { rgPatterns: [], hotDirs: [] };
+
+  try {
+    const { tree: miniMap, depth } = getRepoMap(projectRoot, bootstrapTreeDepth, excludePaths);
+    const systemPrompt = buildBootstrapPrompt(bootstrapMaxTurns, bootstrapMaxCommands);
+    const userContent = `Problem Statement: ${query}\n\nRepo Map (tree -L ${depth} /codebase):\n\`\`\`text\n${miniMap}\n\`\`\``;
+
+    const messages = [
+      { role: 5, content: systemPrompt },
+      { role: 1, content: userContent },
+    ];
+
+    const toolDefs = getToolDefinitions(bootstrapMaxCommands);
+    const executor = new ToolExecutor(projectRoot);
+
+    for (let turn = 0; turn < bootstrapMaxTurns; turn++) {
+      log(`Turn ${turn + 1}/${bootstrapMaxTurns}`);
+      const proto = _buildRequest(apiKey, jwt, messages, toolDefs);
+      let respData;
+      try {
+        respData = await _streamingRequest(proto, timeoutMs);
+      } catch (e) {
+        log(`request failed: ${e.code || "UNKNOWN"}`);
+        break;
+      }
+
+      const [thinking, toolInfo] = _parseResponse(respData);
+      if (!toolInfo) break;
+
+      const [toolName, toolArgs] = toolInfo;
+      if (toolName !== "restricted_exec") break;
+
+      const callId = randomUUID();
+      const argsJson = JSON.stringify(toolArgs);
+      const cmds = Object.keys(toolArgs).filter((k) => k.startsWith("command"));
+
+      for (const cmdKey of cmds) {
+        const cmd = toolArgs[cmdKey];
+        if (!cmd || typeof cmd !== "object") continue;
+        if (cmd.type === "rg" && typeof cmd.pattern === "string" && cmd.pattern) {
+          hints.rgPatterns.push(cmd.pattern);
+        }
+        if (cmd.type === "tree" && typeof cmd.path === "string") {
+          const top = _extractTopDirFromCodebasePath(cmd.path);
+          if (top) hints.hotDirs.push(top);
+        }
+      }
+
+      const results = await executor.execToolCallAsync(toolArgs);
+      messages.push({
+        role: 2,
+        content: thinking,
+        tool_call_id: callId,
+        tool_name: "restricted_exec",
+        tool_args_json: argsJson,
+      });
+      messages.push({ role: 4, content: results, ref_call_id: callId });
+    }
+  } catch {
+    // Bootstrap is best-effort. Fall back silently.
+  }
+
+  return {
+    rgPatterns: [...new Set(hints.rgPatterns)].slice(-30),
+    hotDirs: [...new Set(hints.hotDirs)].slice(-12),
+  };
 }
 
 // ─── Tool Schema ───────────────────────────────────────────
@@ -882,81 +1030,38 @@ function stripInvalidUtf8(buf) {
  * @returns {[string, string, Object]|null} [thinking, name, args] or null
  */
 function _parseToolCall(text) {
-  // 清理常见的结束标记
-  text = text.replace(/<\/s>/g, "").replace(/\{\}$/g, "");
+  text = text.replace(/<\/s>/g, "");
   const m = text.match(/\[TOOL_CALLS\](\w+)\[ARGS\](\{.+)/s);
   if (!m) return null;
 
   const name = m[1];
-  let raw = m[2].trim();
+  const raw = m[2].trim();
 
-  // 清理尾部的非 JSON 字符
-  raw = raw.replace(/<\/s>\s*\{\}$/g, "").replace(/<\/s>$/g, "").replace(/\{\}$/g, "");
-
-  // Find matching closing brace (考虑字符串内的括号)
+  // Find matching closing brace
   let depth = 0;
   let end = 0;
-  let inString = false;
-  let escape = false;
-
   for (let i = 0; i < raw.length; i++) {
-    const c = raw[i];
-
-    if (escape) {
-      escape = false;
-      continue;
-    }
-
-    if (c === '\\' && inString) {
-      escape = true;
-      continue;
-    }
-
-    if (c === '"') {
-      inString = !inString;
-      continue;
-    }
-
-    if (!inString) {
-      if (c === "{") depth++;
-      else if (c === "}") {
-        depth--;
-        if (depth === 0) {
-          end = i + 1;
-          break;
-        }
+    if (raw[i] === "{") depth++;
+    else if (raw[i] === "}") {
+      depth--;
+      if (depth === 0) {
+        end = i + 1;
+        break;
       }
     }
   }
-
-  if (end === 0) {
-    // 没找到匹配的闭合括号，尝试补全
-    if (depth > 0) {
-      raw = raw + "}".repeat(depth);
-      end = raw.length;
-    } else {
-      end = raw.length;
-    }
-  }
+  if (end === 0) end = raw.length;
 
   let args;
-  const jsonStr = raw.slice(0, end);
+  const jsonCandidate = raw.slice(0, end);
   try {
-    args = JSON.parse(jsonStr);
-  } catch (e) {
-    // 尝试修复更多格式问题后重试
+    args = JSON.parse(jsonCandidate);
+  } catch {
+    // Attempt lenient fix: unquoted keys like  exclude":  →  "exclude":
     try {
-      let fixed = jsonStr;
-      // 修复缺少引号的 key
-      fixed = fixed.replace(/,(\w+)":/g, ',"$1":');
-      // 修复单引号
-      fixed = fixed.replace(/'/g, '"');
+      const fixed = jsonCandidate.replace(/([{,]\s*)(\w+)\s*:/g, '$1"$2":');
       args = JSON.parse(fixed);
     } catch {
-      if (process.env.FAST_CONTEXT_DEBUG === "1") {
-        console.error(`[DEBUG] JSON parse failed: ${e.message}`);
-        console.error(`[DEBUG] Raw JSON: ${jsonStr.slice(0, 200)}...`);
-      }
       return null;
     }
   }
@@ -973,7 +1078,6 @@ function _parseToolCall(text) {
 function _parseResponse(data) {
   const frames = connectFrameDecode(data);
   let allText = "";
-  let foundToolCalls = false;
 
   for (const frameData of frames) {
     // Check for error JSON
@@ -993,19 +1097,14 @@ function _parseResponse(data) {
 
     // Extract text from frame — strip invalid UTF-8 (matches Python errors="ignore")
     const rawText = stripInvalidUtf8(frameData);
-
-    // 累积所有文本，不要在找到 [TOOL_CALLS] 时就 break
     if (rawText.includes("[TOOL_CALLS]")) {
-      foundToolCalls = true;
-      allText += rawText;
-    } else if (foundToolCalls) {
-      // 继续累积 [TOOL_CALLS] 之后的内容
-      allText += rawText;
-    } else {
-      for (const s of extractStrings(frameData)) {
-        if (s.length > 10) {
-          allText += s;
-        }
+      allText = rawText;
+      break;
+    }
+
+    for (const s of extractStrings(frameData)) {
+      if (s.length > 10) {
+        allText += s;
       }
     }
   }
@@ -1075,6 +1174,18 @@ function _suggestTreeDepth(projectRoot) {
   return 2;
 }
 
+function _normalizeTreeRoot(treeStr, absRoot, virtualRoot = "/codebase") {
+  const rootPattern = new RegExp(absRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g");
+  let out = String(treeStr || "").replace(rootPattern, virtualRoot);
+  const lines = out.split("\n");
+  const dirName = absRoot.split("/").pop() || absRoot.split("\\").pop() || absRoot;
+  if (lines[0] === dirName) {
+    lines[0] = virtualRoot;
+    out = lines.join("\n");
+  }
+  return out;
+}
+
 /**
  * Get a directory tree of the project with adaptive depth fallback.
  *
@@ -1082,18 +1193,16 @@ function _suggestTreeDepth(projectRoot) {
  * automatically falls back to lower depths until it fits.
  *
  * @param {string} projectRoot
- * @param {number} [targetDepth=3] - Desired tree depth (1-6), 0 means auto
+ * @param {number} [targetDepth=3] - Desired tree depth (0-6), 0 means auto
  * @param {string[]} [excludePaths=[]] - Patterns to exclude from tree
  * @returns {{ tree: string, depth: number, sizeBytes: number, fellBack: boolean, autoDepth: boolean }}
  */
 function getRepoMap(projectRoot, targetDepth = 3, excludePaths = []) {
-  // Auto depth: if targetDepth is 0 or not specified, use heuristic
+  // Auto depth: if targetDepth is 0, use heuristic
   const autoDepth = targetDepth === 0;
   if (autoDepth) {
     targetDepth = _suggestTreeDepth(projectRoot);
   }
-  const rootPattern = new RegExp(projectRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g");
-  const dirName = projectRoot.split("/").pop() || projectRoot.split("\\").pop() || projectRoot;
   const excludeRegexes = excludePaths.length ? excludePaths.map(_excludePatternToRegex) : [];
 
   for (let L = targetDepth; L >= 1; L--) {
@@ -1101,14 +1210,8 @@ function getRepoMap(projectRoot, targetDepth = 3, excludePaths = []) {
       const opts = { maxDepth: L };
       if (excludeRegexes.length) opts.exclude = excludeRegexes;
       const stdout = treeNodeCli(projectRoot, opts);
-      // tree-node-cli outputs basename as root line; replace with /codebase
-      let treeStr = stdout.replace(rootPattern, "/codebase");
-      // Also replace the basename root line (first line) if full path wasn't matched
-      const lines = treeStr.split("\n");
-      if (lines[0] === dirName) {
-        lines[0] = "/codebase";
-        treeStr = lines.join("\n");
-      }
+      // Normalize root to /codebase consistently.
+      let treeStr = _normalizeTreeRoot(stdout, projectRoot, "/codebase");
       const sizeBytes = Buffer.byteLength(treeStr, "utf-8");
 
       if (sizeBytes <= MAX_TREE_BYTES) {
@@ -1134,40 +1237,186 @@ function getRepoMap(projectRoot, targetDepth = 3, excludePaths = []) {
   }
 }
 
-/**
- * 计算文件相关性得分（用于排序）
- * - 代码行数越多得分越高
- * - 核心目录（src/, lib/, app/）加分
- * - 测试/配置文件减分
- * @param {Object} file - { path, ranges }
- * @returns {number}
- */
-function _scoreFile(file) {
+function _tokenizeQuery(query = "") {
+  return [...new Set(
+    String(query)
+      .toLowerCase()
+      .split(/[^a-z0-9_\-]+/)
+      .map((t) => t.trim())
+      .filter((t) => t.length >= 3)
+  )];
+}
+
+function _scoreTopLevelDir(dirName, queryTokens = []) {
+  const name = String(dirName || "").toLowerCase();
   let score = 0;
 
-  // 基础分：代码行数
-  for (const [start, end] of file.ranges) {
-    score += (end - start + 1);
+  const commonRoots = ["src", "app", "lib", "packages", "services", "server", "backend", "frontend", "api"];
+  if (commonRoots.includes(name)) score += 2;
+
+  for (const token of queryTokens) {
+    if (name.includes(token)) score += 4;
   }
 
-  const p = file.path.toLowerCase();
-
-  // 核心代码目录加分
-  if (/^(src|lib|app|packages|services)\//.test(p)) score += 50;
-
-  // 入口文件加分
-  if (/\/(index|main|app|core)\.[jt]sx?$/.test(p)) score += 30;
-
-  // 测试文件减分
-  if (/\.(test|spec)\.[jt]sx?$/.test(p) || /\/__tests__\//.test(p)) score -= 20;
-
-  // 配置文件减分
-  if (/\.(config|rc)\.[jt]s$/.test(p) || /^\./.test(p)) score -= 10;
-
-  // 类型定义文件减分
-  if (/\.d\.ts$/.test(p)) score -= 15;
-
   return score;
+}
+
+function _listTopLevelDirs(projectRoot, excludePaths = []) {
+  const excludeRegexes = excludePaths.length ? excludePaths.map(_excludePatternToRegex) : [];
+  const out = [];
+  let entries = [];
+  try {
+    entries = readdirSync(projectRoot).sort();
+  } catch {
+    return out;
+  }
+
+  for (const e of entries) {
+    if (excludeRegexes.some((rx) => rx.test(e))) continue;
+    const abs = join(projectRoot, e);
+    try {
+      if (statSync(abs).isDirectory()) out.push(e);
+    } catch {
+      // ignore
+    }
+  }
+  return out;
+}
+
+function _buildSubtreeForDir(projectRoot, dir, levels = 2) {
+  const abs = join(projectRoot, dir);
+  const vRoot = `/codebase/${dir}`;
+  try {
+    const stdout = treeNodeCli(abs, { maxDepth: levels });
+    return _normalizeTreeRoot(stdout, abs, vRoot);
+  } catch {
+    return `${vRoot}\n  (failed to generate subtree)`;
+  }
+}
+
+function buildOptimizedRepoMap({
+  query,
+  projectRoot,
+  treeDepth,
+  excludePaths,
+  optimizer = {},
+  bootstrapHints = null,
+  onProgress = null,
+}) {
+  const log = (msg) => onProgress?.(msg);
+  const cfg = { ...REPO_MAP_OPTIMIZER_DEFAULTS, ...(optimizer || {}) };
+  if (cfg.mode === "classic") {
+    const base = getRepoMap(projectRoot, treeDepth, excludePaths);
+    return {
+      ...base,
+      strategy: "classic",
+      hotDirs: [],
+    };
+  }
+
+  const bootstrapDepth = Math.max(1, Math.min(3, Number(cfg.bootstrapTreeDepth) || 1));
+  const hotspotTopK = Math.max(0, Math.min(8, Number(cfg.hotspotTopK) || 4));
+  const hotspotTreeDepth = Math.max(1, Math.min(4, Number(cfg.hotspotTreeDepth) || 2));
+  const maxBytes = Math.max(16 * 1024, Number(cfg.maxBytes) || REPO_MAP_OPTIMIZER_DEFAULTS.maxBytes);
+
+  const bootstrap = getRepoMap(projectRoot, bootstrapDepth, excludePaths);
+  const topDirs = _listTopLevelDirs(projectRoot, excludePaths);
+
+  // Extract keywords from bootstrap hints (rgPatterns)
+  const keywords = bootstrapHints?.rgPatterns || [];
+
+  // Use BM25F + Probe + RRF for directory scoring
+  // This replaces the old token-based scoring + commonRoots approach
+  let hotDirs = [];
+  let pathSpines = [];
+  try {
+    const results = scoreDirectories(query, projectRoot, topDirs, excludePaths, {
+      topK: hotspotTopK,
+      useProbe: true, // Enable probe grep signal
+      keywords, // Bootstrap keywords
+      minReturn: 2, // Always return at least 2 directories for coverage
+    });
+    hotDirs = results.hotDirs;
+    pathSpines = results.pathSpines;
+    log(`BM25F scoring: hotDirs=[${hotDirs.join(",")}] pathSpines=${pathSpines.length} signals=${JSON.stringify(results.signals)}`);
+  } catch (e) {
+    // Lightweight fallback: use quick scoring without commonRoots
+    log(`BM25F failed, using quick token scoring: ${e.message}`);
+    const queryTerms = tokenizeBM25(query);
+    const scored = topDirs.map((d) => {
+      const dirTerms = tokenizeBM25(d);
+      let score = 0;
+      for (const qt of queryTerms) {
+        if (dirTerms.some(dt => dt.includes(qt) || qt.includes(dt))) score += 1;
+      }
+      return { dir: d, score };
+    }).sort((a, b) => b.score - a.score);
+
+    // Always return at least topK directories (no score > 0 filter)
+    hotDirs = scored.slice(0, hotspotTopK).map((x) => x.dir);
+    if (hotDirs.length === 0) hotDirs = topDirs.slice(0, hotspotTopK);
+    log(`Quick scoring fallback: ${hotDirs.join(",")}`);
+  }
+
+  const hotspotSections = [];
+  for (const d of hotDirs) {
+    hotspotSections.push(_buildSubtreeForDir(projectRoot, d, hotspotTreeDepth));
+  }
+
+  // Build path spines section for deep file visibility
+  const pathSpineSection = pathSpines.length > 0
+    ? "# Relevant File Paths (from BM25F path spine extraction)\n" + pathSpines.map(p => `- /codebase/${p}`).join("\n")
+    : "";
+
+  let tree = bootstrap.tree;
+  const sections = [];
+  if (hotspotSections.length) {
+    sections.push("# Hotspot Subtrees\n" + hotspotSections.join("\n\n"));
+  }
+  if (pathSpineSection) {
+    sections.push(pathSpineSection);
+  }
+  if (sections.length) {
+    tree = `${bootstrap.tree}\n\n${sections.join("\n\n")}`;
+  }
+
+  // Keep map under configurable budget.
+  let sizeBytes = Buffer.byteLength(tree, "utf-8");
+  if (sizeBytes > maxBytes && (hotspotSections.length || pathSpineSection)) {
+    // First try removing path spines
+    if (pathSpineSection) {
+      const withoutSpines = sections.length > 1
+        ? `${bootstrap.tree}\n\n${sections[0]}`
+        : bootstrap.tree;
+      sizeBytes = Buffer.byteLength(withoutSpines, "utf-8");
+      if (sizeBytes <= maxBytes) {
+        tree = withoutSpines;
+      }
+    }
+
+    // If still too large, progressively remove hotspot sections
+    if (sizeBytes > maxBytes && hotspotSections.length) {
+      let kept = [...hotspotSections];
+      while (kept.length > 0) {
+        kept.pop();
+        tree = kept.length
+          ? `${bootstrap.tree}\n\n# Hotspot Subtrees\n${kept.join("\n\n")}`
+          : bootstrap.tree;
+        sizeBytes = Buffer.byteLength(tree, "utf-8");
+        if (sizeBytes <= maxBytes) break;
+      }
+    }
+  }
+
+  return {
+    tree,
+    depth: bootstrap.depth,
+    sizeBytes: Buffer.byteLength(tree, "utf-8"),
+    fellBack: bootstrap.fellBack,
+    autoDepth: bootstrap.autoDepth,
+    strategy: "bootstrap_hotspot",
+    hotDirs,
+  };
 }
 
 /**
@@ -1177,7 +1426,7 @@ function _scoreFile(file) {
  * @returns {{ files: Array }}
  */
 function _parseAnswer(xmlText, projectRoot) {
-  const filesMap = new Map(); // 用于去重
+  const files = [];
   const resolvedRoot = resolve(projectRoot);
   const fileRegex = /<file\s+path=(["'])([^"']+)\1>([\s\S]*?)<\/file>/g;
   let fm;
@@ -1200,53 +1449,9 @@ function _parseAnswer(xmlText, projectRoot) {
       ranges.push([parseInt(rm[1], 10), parseInt(rm[2], 10)]);
     }
 
-    // 合并同一文件的 ranges
-    if (filesMap.has(rel)) {
-      const existing = filesMap.get(rel);
-      existing.ranges.push(...ranges);
-    } else {
-      filesMap.set(rel, { path: rel, full_path: fullPath, ranges });
-    }
+    files.push({ path: rel, full_path: fullPath, ranges });
   }
-
-  // 对每个文件的 ranges 进行合并和排序
-  const files = [];
-  for (const file of filesMap.values()) {
-    file.ranges = _mergeRanges(file.ranges);
-    files.push(file);
-  }
-
-  // 按相关性得分排序（高分在前）
-  files.sort((a, b) => _scoreFile(b) - _scoreFile(a));
-
   return { files };
-}
-
-/**
- * 合并重叠或相邻的行范围
- * @param {Array<[number, number]>} ranges
- * @returns {Array<[number, number]>}
- */
-function _mergeRanges(ranges) {
-  if (ranges.length <= 1) return ranges;
-
-  // 按起始行排序
-  ranges.sort((a, b) => a[0] - b[0]);
-
-  const merged = [ranges[0]];
-  for (let i = 1; i < ranges.length; i++) {
-    const last = merged[merged.length - 1];
-    const curr = ranges[i];
-
-    // 如果当前范围与上一个重叠或相邻（间隔 <= 5 行），则合并
-    if (curr[0] <= last[1] + 5) {
-      last[1] = Math.max(last[1], curr[1]);
-    } else {
-      merged.push(curr);
-    }
-  }
-
-  return merged;
 }
 
 /**
@@ -1277,10 +1482,19 @@ export async function search({
   treeDepth = 3,
   timeoutMs = 30000,
   excludePaths = [],
+  repoMapMode = "bootstrap_hotspot",
+  bootstrapTreeDepth = 1,
+  hotspotTopK = 4,
+  hotspotTreeDepth = 2,
+  hotspotMaxBytes = 120 * 1024,
+  bootstrapEnabled = true,
+  bootstrapMaxTurns = 2,
+  bootstrapMaxCommands = 6,
   onProgress = null,
 }) {
   const log = (msg) => onProgress?.(msg);
   projectRoot = resolve(projectRoot);
+  const effectiveExcludePaths = _mergeExcludePaths(excludePaths);
 
   // Get credentials
   if (!apiKey) {
@@ -1301,8 +1515,39 @@ export async function search({
   const toolDefs = getToolDefinitions(maxCommands);
   const systemPrompt = buildSystemPrompt(maxTurns, maxCommands, maxResults);
 
-  const { tree: repoMap, depth: actualDepth, sizeBytes: treeSizeBytes, fellBack, autoDepth } = getRepoMap(projectRoot, treeDepth, excludePaths);
-  log(`Repo map: tree -L ${actualDepth} (${(treeSizeBytes / 1024).toFixed(1)}KB)${autoDepth ? " [auto]" : ""}${fellBack ? ` [fell back from L=${treeDepth}]` : ""}`);
+  let bootstrapHints = null;
+  if (bootstrapEnabled) {
+    bootstrapHints = await _runBootstrapPhase({
+      query,
+      projectRoot,
+      apiKey,
+      jwt,
+      timeoutMs,
+      excludePaths: effectiveExcludePaths,
+      bootstrapTreeDepth,
+      bootstrapMaxTurns,
+      bootstrapMaxCommands,
+      onProgress,
+    });
+    log(`Bootstrap hints: patterns=${bootstrapHints.rgPatterns.length}, hot_dirs=${bootstrapHints.hotDirs.length}`);
+  }
+
+  const { tree: repoMap, depth: actualDepth, sizeBytes: treeSizeBytes, fellBack, autoDepth, strategy: repoMapStrategy, hotDirs = [] } = buildOptimizedRepoMap({
+    query,
+    projectRoot,
+    treeDepth,
+    excludePaths: effectiveExcludePaths,
+    optimizer: {
+      mode: repoMapMode,
+      bootstrapTreeDepth,
+      hotspotTopK,
+      hotspotTreeDepth,
+      maxBytes: hotspotMaxBytes,
+    },
+    bootstrapHints,
+    onProgress,
+  });
+  log(`Repo map: tree -L ${actualDepth} (${(treeSizeBytes / 1024).toFixed(1)}KB)${fellBack ? ` [fell back from L=${treeDepth}]` : ""}${autoDepth ? " [auto]" : ""} [strategy=${repoMapStrategy}]${hotDirs.length ? ` [hot=${hotDirs.join(",")}]` : ""}`);
   const userContent = `Problem Statement: ${query}\n\nRepo Map (tree -L ${actualDepth} /codebase):\n\`\`\`text\n${repoMap}\n\`\`\``;
 
   const messages = [
@@ -1310,25 +1555,28 @@ export async function search({
     { role: 1, content: userContent },
   ];
 
+  // Trim state for smart context trimming
   const trimState = {
     query,
-    recentCommands: [],
+    turn: 0,
     recentFiles: [],
     recentPatterns: [],
-    turn: 0,
+    recentCommands: [],
   };
 
   // Total API calls = maxTurns + 1 (last round for answer)
   const totalApiCalls = maxTurns + 1;
   let compensatedTurns = 0;
+  const MAX_COMPENSATIONS = 2;
+  let forceAnswerInjected = false;
 
   for (let turn = 0; turn < totalApiCalls + compensatedTurns; turn++) {
-    trimState.turn = turn + 1;
     log(`Turn ${turn + 1}/${totalApiCalls}`);
+    trimState.turn = turn + 1;
 
     let proto = _buildRequest(apiKey, jwt, messages, toolDefs);
 
-    // Debug: 打印请求信息
+    // Debug logging
     if (DEBUG_MODE) {
       console.error(`\n[DEBUG] ===== Turn ${turn + 1} Request =====`);
       console.error(`[DEBUG] Messages count: ${messages.length}`);
@@ -1337,7 +1585,6 @@ export async function search({
     }
 
     // Preflight trim: proactively reduce payload if proto is already large.
-    // Server-side payload limit is ~346KB; keep a safety margin.
     const MAX_PROTO_BYTES = 320 * 1024;
     if (proto.length > MAX_PROTO_BYTES && messages.length > 1) {
       log(`Proto size ${proto.length} bytes > ${MAX_PROTO_BYTES}. Trimming context before request...`);
@@ -1352,7 +1599,15 @@ export async function search({
       respData = await _streamingRequest(proto, timeoutMs);
     } catch (e) {
       const errCode = e.code || "UNKNOWN";
-      const baseMeta = { treeDepth: actualDepth, treeSizeKB: +(treeSizeBytes / 1024).toFixed(1), fellBack, projectRoot, errorCode: errCode };
+      const baseMeta = {
+        treeDepth: actualDepth,
+        treeSizeKB: +(treeSizeBytes / 1024).toFixed(1),
+        fellBack,
+        projectRoot,
+        errorCode: errCode,
+        repoMapStrategy,
+        hotDirs,
+      };
 
       // Auto-retry with trimmed context on payload/timeout errors
       if ((errCode === "PAYLOAD_TOO_LARGE" || errCode === "TIMEOUT") && messages.length > 1) {
@@ -1380,7 +1635,7 @@ export async function search({
 
     const [thinking, toolInfo] = _parseResponse(respData);
 
-    // Debug: 打印响应信息
+    // Debug logging
     if (DEBUG_MODE) {
       console.error(`\n[DEBUG] ===== Turn ${turn + 1} Response =====`);
       console.error(`[DEBUG] Response size: ${respData.length} bytes`);
@@ -1402,7 +1657,13 @@ export async function search({
       log("Received final answer");
       const result = _parseAnswer(answerXml, projectRoot);
       result.rg_patterns = [...new Set(executor.collectedRgPatterns)];
-      result._meta = { treeDepth: actualDepth, treeSizeKB: +(treeSizeBytes / 1024).toFixed(1), fellBack };
+      result._meta = {
+        treeDepth: actualDepth,
+        treeSizeKB: +(treeSizeBytes / 1024).toFixed(1),
+        fellBack,
+        repoMapStrategy,
+        hotDirs,
+      };
       return result;
     }
 
@@ -1413,7 +1674,7 @@ export async function search({
       const cmds = Object.keys(toolArgs).filter((k) => k.startsWith("command"));
       log(`Executing ${cmds.length} local commands`);
 
-      // Debug: 打印工具调用详情
+      // Debug logging
       if (DEBUG_MODE) {
         console.error(`\n[DEBUG] ===== Tool Calls =====`);
         for (const cmdKey of cmds) {
@@ -1427,14 +1688,16 @@ export async function search({
         const cmd = toolArgs[k];
         return cmd && typeof cmd === "object" && cmd.type;
       });
-      if (validCommands.length === 0) {
+      if (validCommands.length === 0 && compensatedTurns < MAX_COMPENSATIONS) {
         compensatedTurns++;
-        log("Turn compensation: no valid commands, extending search by 1 turn");
+        log(`Turn compensation: no valid commands, extending search by 1 turn (${compensatedTurns}/${MAX_COMPENSATIONS})`);
+      } else if (validCommands.length === 0) {
+        log(`Turn compensation skipped: max compensations (${MAX_COMPENSATIONS}) reached, forcing turn advance`);
       }
 
       const results = await executor.execToolCallAsync(toolArgs);
 
-      // Update trim state with a compact, deterministic summary of what we executed.
+      // Update trim state with a compact summary of what we executed
       try {
         const tailUnique = (arr, n) => {
           const out = [];
@@ -1452,50 +1715,28 @@ export async function search({
         const newCommands = [];
         const newFiles = [];
         const newPatterns = [];
+
         for (const cmdKey of cmds) {
           const cmd = toolArgs[cmdKey];
-          if (!cmd || typeof cmd !== "object" || !cmd.type) continue;
-          if (cmd.type === "rg") {
-            const pat = typeof cmd.pattern === "string" ? cmd.pattern : "";
-            const pth = typeof cmd.path === "string" ? cmd.path : "";
-            if (pat) newPatterns.push(pat);
-            newCommands.push({ type: "rg", desc: `rg(${JSON.stringify(pat)} in ${JSON.stringify(pth)})` });
-          } else if (cmd.type === "readfile") {
-            const file = typeof cmd.file === "string" ? cmd.file : "";
-            if (file) newFiles.push(file);
-            const s = cmd.start_line ? String(cmd.start_line) : "";
-            const e = cmd.end_line ? String(cmd.end_line) : "";
-            const r = s || e ? `:${s || ""}-${e || ""}` : "";
-            newCommands.push({ type: "readfile", desc: `readfile(${JSON.stringify(file)}${r})` });
-          } else if (cmd.type === "tree") {
-            const pth = typeof cmd.path === "string" ? cmd.path : "";
-            const lv = Number.isInteger(cmd.levels) ? cmd.levels : null;
-            newCommands.push({ type: "tree", desc: `tree(${JSON.stringify(pth)}${lv ? ` L=${lv}` : ""})` });
-          } else if (cmd.type === "ls") {
-            const pth = typeof cmd.path === "string" ? cmd.path : "";
-            newCommands.push({ type: "ls", desc: `ls(${JSON.stringify(pth)})` });
-          } else if (cmd.type === "glob") {
-            const pat = typeof cmd.pattern === "string" ? cmd.pattern : "";
-            const pth = typeof cmd.path === "string" ? cmd.path : "";
-            newCommands.push({ type: "glob", desc: `glob(${JSON.stringify(pat)} in ${JSON.stringify(pth)})` });
+          if (!cmd || typeof cmd !== "object") continue;
+          const t = cmd.type;
+          if (t === "rg" && cmd.pattern) {
+            newPatterns.push(cmd.pattern);
+            newCommands.push({ type: "rg", desc: `rg ${cmd.pattern}` });
+          } else if (t === "readfile" && cmd.file) {
+            const shortFile = cmd.file.replace(/^\/codebase\//, "");
+            newFiles.push(shortFile);
+            newCommands.push({ type: "readfile", desc: `read ${shortFile}` });
+          } else if (t === "tree" && cmd.path) {
+            newCommands.push({ type: "tree", desc: `tree ${cmd.path}` });
           }
         }
-        trimState.recentCommands.push(...newCommands);
-        trimState.recentFiles.push(...newFiles);
-        trimState.recentPatterns.push(...newPatterns);
-        // Keep state bounded.
-        trimState.recentCommands = trimState.recentCommands.slice(-30);
-        trimState.recentFiles = tailUnique(trimState.recentFiles, 50);
-        trimState.recentPatterns = tailUnique(trimState.recentPatterns, 80);
-      } catch {
-        // Best-effort only; trimming must never break search.
-      }
 
-      // Debug: 打印执行结果摘要
-      if (DEBUG_MODE) {
-        console.error(`\n[DEBUG] ===== Execution Results =====`);
-        console.error(`[DEBUG] Results length: ${results.length} chars`);
-        console.error(`[DEBUG] Results preview: ${results.slice(0, 500)}${results.length > 500 ? '...' : ''}`);
+        trimState.recentCommands = [...trimState.recentCommands, ...newCommands].slice(-12);
+        trimState.recentFiles = tailUnique([...trimState.recentFiles, ...newFiles], 20);
+        trimState.recentPatterns = tailUnique([...trimState.recentPatterns, ...newPatterns], 30);
+      } catch {
+        // Ignore errors in trim state update
       }
 
       messages.push({
@@ -1507,9 +1748,11 @@ export async function search({
       });
       messages.push({ role: 4, content: results, ref_call_id: callId });
 
-      // Inject force-answer after last search round
-      if (turn >= maxTurns - 1) {
+      // Inject force-answer after last effective search round
+      const effectiveTurn = turn - compensatedTurns;
+      if (effectiveTurn >= maxTurns - 1 && !forceAnswerInjected) {
         messages.push({ role: 1, content: FINAL_FORCE_ANSWER });
+        forceAnswerInjected = true;
         log("Injected force-answer prompt");
       }
     }
@@ -1519,7 +1762,14 @@ export async function search({
     files: [],
     error: "Max turns reached without getting an answer",
     rg_patterns: [...new Set(executor.collectedRgPatterns)],
-    _meta: { treeDepth: actualDepth, treeSizeKB: +(treeSizeBytes / 1024).toFixed(1), fellBack, projectRoot },
+    _meta: {
+      treeDepth: actualDepth,
+      treeSizeKB: +(treeSizeBytes / 1024).toFixed(1),
+      fellBack,
+      projectRoot,
+      repoMapStrategy,
+      hotDirs,
+    },
   };
 }
 
@@ -1548,8 +1798,34 @@ export async function searchWithContent({
   treeDepth = 3,
   timeoutMs = 30000,
   excludePaths = [],
+  repoMapMode = "bootstrap_hotspot",
+  bootstrapTreeDepth = 1,
+  hotspotTopK = 4,
+  hotspotTreeDepth = 2,
+  hotspotMaxBytes = 120 * 1024,
+  bootstrapEnabled = true,
+  bootstrapMaxTurns = 2,
+  bootstrapMaxCommands = 6,
 }) {
-  const result = await search({ query, projectRoot, apiKey, maxTurns, maxCommands, maxResults, treeDepth, timeoutMs, excludePaths });
+  const result = await search({
+    query,
+    projectRoot,
+    apiKey,
+    maxTurns,
+    maxCommands,
+    maxResults,
+    treeDepth,
+    timeoutMs,
+    excludePaths,
+    repoMapMode,
+    bootstrapTreeDepth,
+    hotspotTopK,
+    hotspotTreeDepth,
+    hotspotMaxBytes,
+    bootstrapEnabled,
+    bootstrapMaxTurns,
+    bootstrapMaxCommands,
+  });
 
   if (result.error) {
     const meta = result._meta;
@@ -1582,7 +1858,10 @@ export async function searchWithContent({
 
   if (!files.length && !uniquePatterns.length) {
     const raw = result.raw_response || "";
-    return raw ? `No relevant files found.\n\nRaw response:\n${raw}` : "No relevant files found.";
+    if (!raw) return "No relevant files found.";
+    const MAX_RAW = 500;
+    const truncated = raw.length > MAX_RAW ? raw.slice(0, MAX_RAW) + "\n...[raw_response truncated]..." : raw;
+    return `No relevant files found.\n\nRaw response:\n${truncated}`;
   }
 
   const parts = [];
