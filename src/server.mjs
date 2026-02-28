@@ -74,7 +74,7 @@ const FC_SNIPPETS_EXPLICITLY_SET = process.env.FC_INCLUDE_SNIPPETS != null;
 
 const server = new McpServer({
   name: "windsurf-fast-context",
-  version: "1.2.1",
+  version: "1.2.2",
   instructions:
     "Windsurf Fast Context — AI-driven semantic code search. " +
     "Returns file paths with line ranges and grep keywords.\n" +
