@@ -617,7 +617,7 @@ function extractPathSpines(profiles, queryTerms, keywords, topN = 30) {
       const pathTokens = tokenizePath(filePath);
       const pathText = filePath.toLowerCase();
       // Extract bare filename without extension for filename-level matching
-      const parts = filePath.split("/");
+      const parts = filePath.split(/[\/\\]/);
       const fileName = parts[parts.length - 1].replace(/\.[^.]+$/, "").toLowerCase();
       const fileNameTokens = tokenizePath(fileName);
 
