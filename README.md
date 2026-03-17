@@ -130,7 +130,7 @@ AI-driven semantic code search with tunable parameters.
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `query` | string | Yes | — | Natural language search query |
-| `project_path` | string | No | cwd | Absolute path to project root |
+| `project_path` | string | **Yes** | — | Absolute path to project root directory |
 | `tree_depth` | integer | No | `3` | Directory tree depth for repo map (1-6). Higher = more context but larger payload. Auto falls back to lower depth if tree exceeds 250KB. Use 1-2 for huge monorepos (>5000 files), 3 for most projects, 4-6 for small projects. |
 | `max_turns` | integer | No | `3` | Search rounds (1-5). More = deeper search but slower. Use 1-2 for simple lookups, 3 for most queries, 4-5 for complex analysis. |
 | `max_results` | integer | No | `10` | Maximum number of files to return (1-30). Smaller = more focused, larger = broader exploration. |
@@ -138,7 +138,7 @@ AI-driven semantic code search with tunable parameters.
 Returns:
 1. **Relevant files** with line ranges
 2. **Suggested search keywords** (rg patterns used during AI search)
-3. **Diagnostic metadata** (`[config]` line showing actual tree_depth used, tree size, and whether fallback occurred)
+3. **Diagnostic metadata** (`[config]` line showing project_path, actual tree_depth used, tree size, and whether fallback occurred)
 
 Example output:
 ```
@@ -150,7 +150,7 @@ Found 3 relevant files.
 
 grep keywords: authenticate, jwt.*verify, session.*token
 
-[config] tree_depth=3, tree_size=12.5KB, max_turns=3
+[config] project_path=/project, tree_depth=3, tree_size=12.5KB, max_turns=3
 ```
 
 Error output includes status-specific hints:

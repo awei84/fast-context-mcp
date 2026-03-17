@@ -19,6 +19,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 
 import { searchWithContent, extractKeyInfo } from "./core.mjs";
+import { projectPathSchema, validateProjectPath } from "./project-path.mjs";
 
 /**
  * Parse an integer env var with optional clamping.
@@ -74,7 +75,7 @@ const FC_SNIPPETS_EXPLICITLY_SET = process.env.FC_INCLUDE_SNIPPETS != null;
 
 const server = new McpServer({
   name: "windsurf-fast-context",
-  version: "1.2.2",
+  version: "1.3.0",
   instructions:
     "Windsurf Fast Context — AI-driven semantic code search. " +
     "Returns file paths with line ranges and grep keywords.\n" +
@@ -121,10 +122,10 @@ server.tool(
     query: z.string().describe(
       'Natural language search query (e.g. "where is auth handled", "database connection pool")'
     ),
-    project_path: z
-      .string()
-      .default("")
-      .describe("Absolute path to project root. Empty = current working directory."),
+    project_path: projectPathSchema.describe(
+      "Absolute path to project root directory (required). " +
+      "Example: /Users/username/projects/myproject or C:/Users/username/projects/myproject"
+    ),
     tree_depth: z
       .number()
       .int()
@@ -250,15 +251,10 @@ server.tool(
     bootstrap_max_commands,
     include_code_snippets,
   }) => {
-    let projectPath = project_path || process.cwd();
-
-    try {
-      const { statSync } = await import("node:fs");
-      if (!statSync(projectPath).isDirectory()) {
-        return { content: [{ type: "text", text: `Error: project path does not exist: ${projectPath}` }] };
-      }
-    } catch {
-      return { content: [{ type: "text", text: `Error: project path does not exist: ${projectPath}` }] };
+    const projectPath = project_path;
+    const validationError = validateProjectPath(projectPath);
+    if (validationError) {
+      return { content: [{ type: "text", text: validationError }] };
     }
 
     try {

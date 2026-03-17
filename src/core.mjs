@@ -2151,7 +2151,7 @@ export async function searchWithContent({
     const fbNote = meta.fellBack ? ` (fell back from requested depth)` : "";
     parts.push("");
     const hotspotNote = meta.hotspotDepth ? `, hotspot_depth=${meta.hotspotDepth}` : "";
-    let configLine = `[config] tree_depth=${meta.treeDepth}${fbNote}${hotspotNote}, tree_size=${meta.treeSizeKB}KB, max_turns=${maxTurns}, max_results=${maxResults}, timeout_ms=${timeoutMs}`;
+    let configLine = `[config] project_path=${projectRoot}, tree_depth=${meta.treeDepth}${fbNote}${hotspotNote}, tree_size=${meta.treeSizeKB}KB, max_turns=${maxTurns}, max_results=${maxResults}, timeout_ms=${timeoutMs}`;
     if (excludePaths.length) configLine += `, exclude_paths=[${excludePaths.join(", ")}]`;
     if (grepExpanded > 0) configLine += `, grep_expanded=${grepExpanded}`;
     parts.push(configLine);
