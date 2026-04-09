@@ -1,5 +1,7 @@
 # Fast Context MCP
 
+[English](./README.md) · [中文](./README_CN.md)
+
 AI-driven semantic code search as an MCP tool — powered by Windsurf's reverse-engineered SWE-grep protocol.
 
 Any MCP-compatible client (Claude Code, Claude Desktop, Cursor, etc.) can use this to search codebases with natural language queries. All tools are bundled via npm — **no system-level dependencies** needed (ripgrep via `@vscode/ripgrep`, tree via `tree-node-cli`). Works on macOS, Windows, and Linux.
@@ -43,6 +45,21 @@ No need to install ripgrep — it's bundled via `@vscode/ripgrep`.
 
 ## Installation
 
+### Option A: npm (recommended)
+
+Published on npm as two equivalent package names:
+
+```bash
+# pick either one — same package, same functionality
+npx fast-context-mcp
+# or
+npx fast-cxt-mcp
+```
+
+No global install required. `npx` will pull the latest version automatically.
+
+### Option B: from source
+
 ```bash
 git clone https://github.com/SammySnake-d/fast-context-mcp.git
 cd fast-context-mcp
@@ -72,6 +89,20 @@ Add to `~/.claude.json` under `mcpServers`:
 ```json
 {
   "fast-context": {
+    "command": "npx",
+    "args": ["-y", "fast-context-mcp"],
+    "env": {
+      "WINDSURF_API_KEY": "sk-ws-01-xxxxx"
+    }
+  }
+}
+```
+
+Or if installed from source:
+
+```json
+{
+  "fast-context": {
     "command": "node",
     "args": ["/absolute/path/to/fast-context-mcp/src/server.mjs"],
     "env": {
@@ -88,8 +119,8 @@ Add to `claude_desktop_config.json` under `mcpServers`:
 ```json
 {
   "fast-context": {
-    "command": "node",
-    "args": ["/absolute/path/to/fast-context-mcp/src/server.mjs"],
+    "command": "npx",
+    "args": ["-y", "fast-context-mcp"],
     "env": {
       "WINDSURF_API_KEY": "sk-ws-01-xxxxx"
     }
@@ -214,7 +245,7 @@ fast-context-mcp/
 | `@modelcontextprotocol/sdk` | MCP server framework |
 | `@vscode/ripgrep` | Bundled ripgrep binary (cross-platform) |
 | `tree-node-cli` | Cross-platform directory tree (replaces system `tree`) |
-| `better-sqlite3` | Read Windsurf's local SQLite DB |
+| `sql.js` | Read Windsurf's local SQLite DB |
 | `zod` | Schema validation (MCP SDK requirement) |
 
 ## License
