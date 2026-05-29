@@ -192,6 +192,12 @@ directory, not \`.
   - tree: Display directory structure as a tree
     - Required: path (string)
     - Optional: levels (int)
+  - ls: List files in a directory
+    - Required: path (string)
+    - Optional: long_format (bool), all (bool)
+  - glob: Find files matching a glob pattern
+    - Required: pattern (string), path (string)
+    - Optional: type_filter (file|directory|all)
 
 # THINKING RULES
 - Think step-by-step. Plan, reason, and reflect before each tool call.
@@ -727,11 +733,11 @@ function _getJwtExp(jwt) {
  * @param {string} apiKey
  * @returns {Promise<string>}
  */
-async function getCachedJwt(apiKey) {
+async function getCachedJwt(apiKey, timeoutMs = 30000) {
   const now = Math.floor(Date.now() / 1000);
   const cached = _jwtCache.get(apiKey);
   if (cached && cached.expiresAt > now + 60) return cached.token;
-  const token = await fetchJwt(apiKey);
+  const token = await fetchJwt(apiKey, timeoutMs);
   const exp = _getJwtExp(token);
   _jwtCache.set(apiKey, { token, expiresAt: exp || now + 3600 });
   return token;
@@ -762,7 +768,7 @@ function _applyTlsFallback() {
  * @param {boolean} [compress=true]
  * @returns {Promise<Buffer>}
  */
-async function _unaryRequest(url, protoBytes, compress = true) {
+async function _unaryRequest(url, protoBytes, compress = true, timeoutMs = 30000) {
   const headers = {
     "Content-Type": "application/proto",
     "Connect-Protocol-Version": "1",
@@ -782,7 +788,7 @@ async function _unaryRequest(url, protoBytes, compress = true) {
     method: "POST",
     headers,
     body,
-    signal: AbortSignal.timeout(30000),
+    signal: AbortSignal.timeout(Number.isFinite(timeoutMs) ? timeoutMs : 30000),
   });
 
   let resp;
@@ -897,7 +903,7 @@ async function _streamingRequest(protoBytes, timeoutMs = 30000, maxRetries = 2) 
  * @param {string} apiKey
  * @returns {Promise<string>}
  */
-async function fetchJwt(apiKey) {
+async function fetchJwt(apiKey, timeoutMs = 30000) {
   const meta = new ProtobufEncoder();
   meta.writeString(1, WS_APP);
   meta.writeString(2, WS_APP_VER);
@@ -910,7 +916,7 @@ async function fetchJwt(apiKey) {
   const outer = new ProtobufEncoder();
   outer.writeMessage(1, meta);
 
-  const resp = await _unaryRequest(`${AUTH_BASE}/GetUserJwt`, outer.toBuffer(), false);
+  const resp = await _unaryRequest(`${AUTH_BASE}/GetUserJwt`, outer.toBuffer(), false, timeoutMs);
   for (const s of extractStrings(resp)) {
     if (s.startsWith("eyJ") && s.includes(".")) {
       return s;
@@ -925,16 +931,16 @@ async function fetchJwt(apiKey) {
  * @param {string} jwt
  * @returns {Promise<boolean>}
  */
-async function checkRateLimit(apiKey, jwt) {
+async function checkRateLimit(apiKey, jwt, timeoutMs = 30000) {
   const req = new ProtobufEncoder();
   req.writeMessage(1, _buildMetadata(apiKey, jwt));
   req.writeString(3, WS_MODEL);
 
   try {
-    await _unaryRequest(`${API_BASE}/CheckUserMessageRateLimit`, req.toBuffer(), true);
+    await _unaryRequest(`${API_BASE}/CheckUserMessageRateLimit`, req.toBuffer(), true, timeoutMs);
     return true;
   } catch (e) {
-    if (e.status === 429) return false;
+    if (e.status === 429 || e.code === "RATE_LIMITED") return false;
     return true; // Don't block on network issues
   }
 }
@@ -1538,12 +1544,12 @@ export async function search({
   }
   if (!jwt) {
     log("Fetching JWT...");
-    jwt = await getCachedJwt(apiKey);
+    jwt = await getCachedJwt(apiKey, timeoutMs);
   }
 
   // Check rate limit
   log("Checking rate limit...");
-  if (!(await checkRateLimit(apiKey, jwt))) {
+  if (!(await checkRateLimit(apiKey, jwt, timeoutMs))) {
     return { files: [], error: "Rate limited, please try again later" };
   }
 

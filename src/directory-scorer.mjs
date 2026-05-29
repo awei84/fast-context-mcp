@@ -17,6 +17,7 @@ import { readdirSync, readFileSync, existsSync, statSync } from "fs";
 import { join, resolve, relative, extname, basename, dirname } from "path";
 import { spawnSync } from "child_process";
 import { splitByCase } from "scule";
+import { rgPath } from "@vscode/ripgrep";
 
 // ─── Constants ───────────────────────────────────────────────
 
@@ -429,7 +430,7 @@ function probeGrep(projectRoot, topDirs, probeTerms, excludePaths = []) {
   try {
     // Use smart-case (-S): pattern is all lowercase -> case-insensitive
     // Use fixed-strings (-F) with multiple -e for safety and speed
-    const result = spawnSync("rg", [
+    const result = spawnSync(rgPath, [
       "-l",           // List matching files only
       "--hidden",
       "-S",           // Smart-case: auto ignore-case when pattern is lowercase
@@ -442,6 +443,7 @@ function probeGrep(projectRoot, topDirs, probeTerms, excludePaths = []) {
       encoding: "utf-8",
       timeout: 8000,  // Slightly longer for combined search
       maxBuffer: 2 * 1024 * 1024,
+      env: { ...process.env, RIPGREP_CONFIG_PATH: "" },
     });
 
     if (result.stdout) {

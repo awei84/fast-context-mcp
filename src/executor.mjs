@@ -7,7 +7,7 @@
 
 import { execFileSync, execFile as execFileCb } from "node:child_process";
 import { readdirSync, readFileSync, statSync, existsSync } from "node:fs";
-import { join, resolve, relative, sep, basename } from "node:path";
+import { join, resolve, relative, sep, basename, isAbsolute } from "node:path";
 import { promisify } from "node:util";
 import { rgPath } from "@vscode/ripgrep";
 import treeNodeCli from "tree-node-cli";
@@ -60,18 +60,36 @@ export class ToolExecutor {
   /**
    * Map virtual /codebase path to real filesystem path.
    * @param {string} virtual
-   * @returns {string}
+   * @returns {string|null}
    */
   _real(virtual) {
-    // Guard against undefined/null from malformed AI responses
     if (virtual == null || typeof virtual !== "string") {
-      return this.root;
+      return null;
     }
-    if (virtual.startsWith("/codebase") || virtual.startsWith("\\codebase")) {
-      const rel = virtual.slice("/codebase".length).replace(/^[\/\\]+/, "");
-      return join(this.root, rel);
+    const normalized = virtual.trim().replace(/\\/g, "/");
+    if (!normalized.startsWith("/codebase")) {
+      return null;
     }
-    return virtual;
+    if (normalized !== "/codebase" && !normalized.startsWith("/codebase/")) {
+      return null;
+    }
+    const rel = normalized.slice("/codebase".length).replace(/^[\/\\]+/, "");
+    const abs = resolve(this.root, rel);
+    const relToRoot = relative(this.root, abs);
+    if (relToRoot === ".." || relToRoot.startsWith(`..${sep}`) || isAbsolute(relToRoot)) {
+      return null;
+    }
+    return abs;
+  }
+
+  /**
+   * Format a root-boundary error.
+   * @param {string} kind
+   * @param {string} value
+   * @returns {string}
+   */
+  static _pathError(kind, value) {
+    return `Error: ${kind} must stay within /codebase: ${value}`;
   }
 
   /**
@@ -150,6 +168,9 @@ export class ToolExecutor {
     }
     this.collectedRgPatterns.push(pattern);
     const rp = this._real(path);
+    if (!rp) {
+      return ToolExecutor._pathError("path", path);
+    }
     if (!existsSync(rp)) {
       return `Error: path does not exist: ${path}`;
     }
@@ -205,6 +226,9 @@ export class ToolExecutor {
     }
     this.collectedRgPatterns.push(pattern);
     const rp = this._real(path);
+    if (!rp) {
+      return ToolExecutor._pathError("path", path);
+    }
     if (!existsSync(rp)) {
       return `Error: path does not exist: ${path}`;
     }
@@ -257,6 +281,9 @@ export class ToolExecutor {
       return "Error: missing or invalid file path";
     }
     const rp = this._real(file);
+    if (!rp) {
+      return ToolExecutor._pathError("file path", file);
+    }
     try {
       const stat = statSync(rp);
       if (!stat.isFile()) {
@@ -294,6 +321,9 @@ export class ToolExecutor {
       return "Error: missing or invalid path";
     }
     const rp = this._real(path);
+    if (!rp) {
+      return ToolExecutor._pathError("path", path);
+    }
     try {
       const stat = statSync(rp);
       if (!stat.isDirectory()) {
@@ -338,6 +368,9 @@ export class ToolExecutor {
       return "Error: missing or invalid path";
     }
     const rp = this._real(path);
+    if (!rp) {
+      return ToolExecutor._pathError("path", path);
+    }
     try {
       const stat = statSync(rp);
       if (!stat.isDirectory()) {
@@ -401,6 +434,9 @@ export class ToolExecutor {
       return "Error: missing or invalid path";
     }
     const rp = this._real(path);
+    if (!rp) {
+      return ToolExecutor._pathError("path", path);
+    }
 
     // Use recursive readdir + fnmatch since Node 22 globSync may not be available
     const matches = [];
@@ -492,7 +528,9 @@ export class ToolExecutor {
     if (!args || typeof args !== "object") {
       return "Error: missing or invalid tool args";
     }
-    const keys = Object.keys(args).filter((k) => k.startsWith("command")).sort();
+    const keys = Object.keys(args)
+      .filter((k) => /^command\d+$/.test(k))
+      .sort((a, b) => parseInt(a.slice(7), 10) - parseInt(b.slice(7), 10));
     const tasks = keys.map(async (key) => {
       const output = await this.execCommandAsync(args[key]);
       return `<${key}_result>\n${output}\n</${key}_result>`;
@@ -511,7 +549,9 @@ export class ToolExecutor {
     if (!args || typeof args !== "object") {
       return "Error: missing or invalid tool args";
     }
-    const keys = Object.keys(args).filter((k) => k.startsWith("command")).sort();
+    const keys = Object.keys(args)
+      .filter((k) => /^command\d+$/.test(k))
+      .sort((a, b) => parseInt(a.slice(7), 10) - parseInt(b.slice(7), 10));
     for (const key of keys) {
       const output = this.execCommand(args[key]);
       parts.push(`<${key}_result>\n${output}\n</${key}_result>`);
