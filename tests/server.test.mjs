@@ -1,16 +1,29 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, symlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 
 import pkg from "../package.json" with { type: "json" };
 import {
   SERVER_VERSION,
   buildFastContextSearchTool,
+  isDirectRun,
   readRuntimeConfig,
 } from "../src/server.mjs";
 
 describe("server metadata", () => {
   it("uses package.json as the MCP server version source", () => {
     assert.equal(SERVER_VERSION, pkg.version);
+  });
+
+  it("treats npm bin symlinks as direct execution", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "fc-server-bin-"));
+    const realServerPath = resolve("src/server.mjs");
+    const binLinkPath = join(tempDir, "fast-context-mcp");
+    symlinkSync(realServerPath, binLinkPath);
+
+    assert.equal(isDirectRun(binLinkPath), true);
   });
 });
 

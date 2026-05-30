@@ -676,13 +676,43 @@ function getToolDefinitions(maxCommands = 8) {
 // ─── Credentials ───────────────────────────────────────────
 
 /**
- * Auto-discover Windsurf API key from local installation.
- * @returns {Promise<string|null>}
+ * 判断从本地提取的 key 是否可接受。
+ * 不对前缀做假设：Windsurf 历史上用过 sk-ws-，后改为 devin-session-token，未来可能再变。
+ * extractKey 已精确取自 windsurfAuthStatus.apiKey 字段，故非空即接受。
+ * @param {unknown} key
+ * @returns {boolean}
  */
+export function isAcceptableApiKey(key) {
+  return typeof key === "string" && key.trim().length > 0;
+}
+
+/**
+ * 检测手动传入的 key 是否疑似被截断。
+ *
+ * 背景：当前 Windsurf key 格式为 `devin-session-token$<JWT>`，真正的凭证是 `$`
+ * 之后那段 JWT。`$` 在 shell / 配置加载器（如 Codex 的 TOML env）中会触发变量展开，
+ * 导致 `$eyJ...` 被当作未定义变量替换为空——key 退化成 `devin-session-token`（或带个
+ * 光秃秃的 `$`），服务端换 JWT 时返回 HTTP 401 invalid api key（已实测证实）。
+ *
+ * 判定规则：以 devin-session-token 开头，但缺少 `$` 之后的 JWT 主体（eyJ 开头）。
+ * @param {unknown} key
+ * @returns {boolean} true 表示疑似被截断
+ */
+export function looksTruncated(key) {
+  if (typeof key !== "string") return false;
+  const k = key.trim();
+  if (!k.startsWith("devin-session-token")) return false;
+  // 完整形态：devin-session-token$<JWT>，$ 后应有 eyJ 开头的 JWT
+  const dollarIdx = k.indexOf("$");
+  if (dollarIdx === -1) return true;          // 完全没有 $ —— 被吃光了
+  const afterDollar = k.slice(dollarIdx + 1);
+  return !afterDollar.startsWith("eyJ");      // 有 $ 但后面不是 JWT —— 残缺
+}
+
 async function autoDiscoverApiKey() {
   try {
     const result = await extractKey();
-    if (result.api_key && result.api_key.startsWith("sk-")) {
+    if (isAcceptableApiKey(result.api_key)) {
       return result.api_key;
     }
   } catch {
@@ -693,11 +723,40 @@ async function autoDiscoverApiKey() {
 
 /**
  * Get API key from env var or auto-discovery.
+ *
+ * 优先级：
+ * 1. 环境变量 WINDSURF_API_KEY —— 但若检测到疑似被 `$` 转义截断，则不信任它，
+ *    自动回退到本地 SQLite 提取完整 key（用户无需改配置即可自愈）。
+ * 2. 自动发现（从 Windsurf 本地 SQLite 读取完整 key）。
  * @returns {Promise<string>}
  */
 async function getApiKey() {
-  const key = process.env.WINDSURF_API_KEY;
-  if (key) return key;
+  const envKey = process.env.WINDSURF_API_KEY;
+
+  if (envKey) {
+    if (looksTruncated(envKey)) {
+      // env 里的 key 疑似被 shell/$ 展开截断，尝试从本地完整提取救回
+      process.stderr.write(
+        `[fast-context] WARNING: WINDSURF_API_KEY looks truncated (length ${envKey.length}, ` +
+        `missing the JWT after '$'). This usually means the '$' was eaten by shell/config ` +
+        `variable expansion. Falling back to auto-discovery from Windsurf's local database...\n`
+      );
+      const recovered = await autoDiscoverApiKey();
+      if (recovered) {
+        process.stderr.write(
+          `[fast-context] Recovered full key from local Windsurf install (length ${recovered.length}).\n`
+        );
+        return recovered;
+      }
+      // 回退也失败：仍用 env key 试（让服务端给出真实错误），但已告警
+      process.stderr.write(
+        `[fast-context] Auto-discovery failed; proceeding with the (likely truncated) env key. ` +
+        `Expect HTTP 401. Fix: remove WINDSURF_API_KEY and rely on auto-discovery, or single-quote / escape '$'.\n`
+      );
+    }
+    return envKey;
+  }
+
   const discovered = await autoDiscoverApiKey();
   if (discovered) return discovered;
   throw new Error(
