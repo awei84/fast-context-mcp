@@ -4,6 +4,10 @@ node_modules/
 
 # Local MCP config (may contain secrets)
 .mcp.json
+.mcp.json.bak
+.codex/
+.npmrc
+*.tgz
 
 # Local docs (not for distribution)
 localdocs/

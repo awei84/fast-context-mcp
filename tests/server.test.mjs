@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, symlinkSync } from "node:fs";
+import { existsSync, mkdtempSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -24,6 +24,10 @@ describe("server metadata", () => {
     symlinkSync(realServerPath, binLinkPath);
 
     assert.equal(isDirectRun(binLinkPath), true);
+  });
+
+  it("has a local development bin link for npx self-resolution", () => {
+    assert.equal(existsSync(resolve("node_modules/.bin/fast-context-mcp")), true);
   });
 });
 
