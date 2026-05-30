@@ -140,6 +140,15 @@ Add to `claude_desktop_config.json` under `mcpServers`:
 | `FC_TIMEOUT_MS` | `30000` | Connect-Timeout-Ms for streaming requests |
 | `FC_RESULT_MAX_LINES` | `50` | Max lines per command output (truncation) |
 | `FC_LINE_MAX_CHARS` | `250` | Max characters per output line (truncation) |
+| `FC_INCLUDE_SNIPPETS` | `false` | Default for returning code snippets with search results |
+| `FC_REPO_MAP_MODE` | `bootstrap_hotspot` | Repo-map strategy (`bootstrap_hotspot` or `classic`) |
+| `FC_BOOTSTRAP_ENABLED` | `true` | Enable the standalone bootstrap phase for hotspot discovery |
+| `FC_BOOTSTRAP_TREE_DEPTH` | `1` | Directory depth used by the bootstrap repo map (1-3) |
+| `FC_BOOTSTRAP_MAX_TURNS` | `2` | Search turns used by the bootstrap phase (1-3) |
+| `FC_BOOTSTRAP_MAX_COMMANDS` | `6` | Max commands per bootstrap turn (1-8) |
+| `FC_HOTSPOT_TOP_K` | `4` | Number of hotspot top-level directories to append (0-8) |
+| `FC_HOTSPOT_TREE_DEPTH` | `2` | Directory depth for each hotspot subtree (1-4) |
+| `FC_HOTSPOT_MAX_BYTES` | `122880` | Byte budget for optimized repo-map output |
 | `WS_MODEL` | `MODEL_SWE_1_6_FAST` | Windsurf model name |
 | `WS_APP_VER` | `1.48.2` | Windsurf app version (protocol metadata) |
 | `WS_LS_VER` | `1.9544.35` | Windsurf language server version (protocol metadata) |
@@ -162,9 +171,11 @@ AI-driven semantic code search with tunable parameters.
 |-----------|------|----------|---------|-------------|
 | `query` | string | Yes | — | Natural language search query |
 | `project_path` | string | **Yes** | — | Absolute path to project root directory |
-| `tree_depth` | integer | No | `3` | Directory tree depth for repo map (1-6). Higher = more context but larger payload. Auto falls back to lower depth if tree exceeds 250KB. Use 1-2 for huge monorepos (>5000 files), 3 for most projects, 4-6 for small projects. |
+| `tree_depth` | integer | No | `3` | Directory tree depth for repo map (0-6, 0 = auto). Higher = more context but larger payload. Auto falls back to lower depth if tree exceeds 250KB. Use 1-2 for huge monorepos (>5000 files), 3 for most projects, 4-6 for small projects. |
 | `max_turns` | integer | No | `3` | Search rounds (1-5). More = deeper search but slower. Use 1-2 for simple lookups, 3 for most queries, 4-5 for complex analysis. |
 | `max_results` | integer | No | `10` | Maximum number of files to return (1-30). Smaller = more focused, larger = broader exploration. |
+| `exclude_paths` | string[] | No | `[]` | Directory/file patterns to exclude from repo map and search context. Useful for large repos or noisy generated files. |
+| `include_code_snippets` | boolean | No | `false` | Include code snippets in the response. Defaults to file paths, line ranges, and grep keywords only. |
 
 Returns:
 1. **Relevant files** with line ranges

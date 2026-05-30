@@ -16,10 +16,15 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { readFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
 import { z } from "zod";
 
 import { searchWithContent, extractKeyInfo } from "./core.mjs";
 import { projectPathSchema, validateProjectPath } from "./project-path.mjs";
+
+const PACKAGE_JSON = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+export const SERVER_VERSION = PACKAGE_JSON.version;
 
 /**
  * Parse an integer env var with optional clamping.
@@ -28,8 +33,8 @@ import { projectPathSchema, validateProjectPath } from "./project-path.mjs";
  * @param {{ min?: number, max?: number }} [opts]
  * @returns {number}
  */
-function readIntEnv(name, defaultValue, opts = {}) {
-  const raw = process.env[name];
+export function readIntEnv(name, defaultValue, opts = {}, env = process.env) {
+  const raw = env[name];
   const parsed = Number.parseInt(raw ?? "", 10);
   if (!Number.isFinite(parsed)) return defaultValue;
   const min = typeof opts.min === "number" ? opts.min : null;
@@ -46,8 +51,8 @@ function readIntEnv(name, defaultValue, opts = {}) {
  * @param {boolean} defaultValue
  * @returns {boolean}
  */
-function readBoolEnv(name, defaultValue) {
-  const raw = process.env[name];
+export function readBoolEnv(name, defaultValue, env = process.env) {
+  const raw = env[name];
   if (raw == null) return defaultValue;
   const v = String(raw).trim().toLowerCase();
   if (["1", "true", "yes", "on"].includes(v)) return true;
@@ -55,70 +60,42 @@ function readBoolEnv(name, defaultValue) {
   return defaultValue;
 }
 
-// Read config from environment
-const MAX_TURNS = readIntEnv("FC_MAX_TURNS", 3, { min: 1, max: 5 });
-const MAX_COMMANDS = readIntEnv("FC_MAX_COMMANDS", 8, { min: 1, max: 20 });
-const TIMEOUT_MS = readIntEnv("FC_TIMEOUT_MS", 30000, { min: 1000, max: 300000 });
+export function readRuntimeConfig(env = process.env) {
+  return {
+    maxTurns: readIntEnv("FC_MAX_TURNS", 3, { min: 1, max: 5 }, env),
+    maxCommands: readIntEnv("FC_MAX_COMMANDS", 8, { min: 1, max: 20 }, env),
+    timeoutMs: readIntEnv("FC_TIMEOUT_MS", 30000, { min: 1000, max: 300000 }, env),
+    repoMapMode: env.FC_REPO_MAP_MODE === "classic" ? "classic" : "bootstrap_hotspot",
+    bootstrapTreeDepth: readIntEnv("FC_BOOTSTRAP_TREE_DEPTH", 1, { min: 1, max: 3 }, env),
+    hotspotTopK: readIntEnv("FC_HOTSPOT_TOP_K", 4, { min: 0, max: 8 }, env),
+    hotspotTreeDepth: readIntEnv("FC_HOTSPOT_TREE_DEPTH", 2, { min: 1, max: 4 }, env),
+    hotspotMaxBytes: readIntEnv("FC_HOTSPOT_MAX_BYTES", 122880, { min: 16384, max: 262144 }, env),
+    bootstrapEnabled: readBoolEnv("FC_BOOTSTRAP_ENABLED", true, env),
+    bootstrapMaxTurns: readIntEnv("FC_BOOTSTRAP_MAX_TURNS", 2, { min: 1, max: 3 }, env),
+    bootstrapMaxCommands: readIntEnv("FC_BOOTSTRAP_MAX_COMMANDS", 6, { min: 1, max: 8 }, env),
+    includeSnippets: readBoolEnv("FC_INCLUDE_SNIPPETS", false, env),
+    includeSnippetsExplicitlySet: env.FC_INCLUDE_SNIPPETS != null,
+  };
+}
 
-// Repo-map optimizer defaults
-const DEFAULT_REPO_MAP_MODE = process.env.FC_REPO_MAP_MODE === "classic" ? "classic" : "bootstrap_hotspot";
-const DEFAULT_BOOTSTRAP_TREE_DEPTH = readIntEnv("FC_BOOTSTRAP_TREE_DEPTH", 1, { min: 1, max: 3 });
-const DEFAULT_HOTSPOT_TOP_K = readIntEnv("FC_HOTSPOT_TOP_K", 4, { min: 0, max: 8 });
-const DEFAULT_HOTSPOT_TREE_DEPTH = readIntEnv("FC_HOTSPOT_TREE_DEPTH", 2, { min: 1, max: 4 });
-const DEFAULT_HOTSPOT_MAX_BYTES = readIntEnv("FC_HOTSPOT_MAX_BYTES", 122880, { min: 16384, max: 262144 });
-const DEFAULT_BOOTSTRAP_ENABLED = readBoolEnv("FC_BOOTSTRAP_ENABLED", true);
-const DEFAULT_BOOTSTRAP_MAX_TURNS = readIntEnv("FC_BOOTSTRAP_MAX_TURNS", 2, { min: 1, max: 3 });
-const DEFAULT_BOOTSTRAP_MAX_COMMANDS = readIntEnv("FC_BOOTSTRAP_MAX_COMMANDS", 6, { min: 1, max: 8 });
-const DEFAULT_INCLUDE_SNIPPETS = readBoolEnv("FC_INCLUDE_SNIPPETS", false);
-// 检测环境变量是否被显式设置（用于调整 AI 提示词）
-const FC_SNIPPETS_EXPLICITLY_SET = process.env.FC_INCLUDE_SNIPPETS != null;
+export function buildFastContextSearchTool({
+  config = readRuntimeConfig(),
+  deps = {},
+} = {}) {
+  const runSearchWithContent = deps.searchWithContent || searchWithContent;
+  const validatePath = deps.validateProjectPath || validateProjectPath;
+  const description =
+    "AI-driven semantic code search using Windsurf's Devstral model. " +
+    "Searches a codebase with natural language and returns relevant file paths with line ranges, " +
+    "plus suggested grep keywords for follow-up searches.\n" +
+    "Use tree_depth/max_turns/max_results for task-level tuning; use exclude_paths to reduce payload or noise.\n" +
+    (config.includeSnippetsExplicitlySet
+      ? `- include_code_snippets: Server-configured default is ${config.includeSnippets}. Do NOT override unless explicitly asked by the user.\n`
+      : "- include_code_snippets: Default false (lightweight mode, ~2-5KB output). " +
+      "Set to true to include full code snippets in the response (~45KB output).\n") +
+    "Response includes a [config] line showing actual parameters used \u2014 use this to decide adjustments on retry.";
 
-const server = new McpServer({
-  name: "windsurf-fast-context",
-  version: "1.3.0",
-  instructions:
-    "Windsurf Fast Context — AI-driven semantic code search. " +
-    "Returns file paths with line ranges and grep keywords.\n" +
-    "Tunable parameters:\n" +
-    "- tree_depth (0-6, default 3; 0=auto): How much directory structure the remote AI sees. " +
-    "REDUCE if you get payload/size errors. INCREASE for small projects where deeper structure helps.\n" +
-    "- max_turns (1-5, default 3): How many search rounds. " +
-    "INCREASE if results are incomplete. Use 1 for quick lookups.\n" +
-    "- max_results (1-30, default 10): Maximum number of files to return.\n" +
-    "- exclude_paths (string array, default []): Directory/file patterns to exclude from tree. " +
-    "Use for large repos to reduce payload size (e.g. ['node_modules', 'dist', '.git']).\n" +
-    "- repo_map_mode (classic | bootstrap_hotspot, default bootstrap_hotspot): Repo-map build strategy.\n" +
-    "- bootstrap_tree_depth (1-3, default 1): Bootstrap tree depth used by bootstrap_hotspot mode.\n" +
-    "- hotspot_top_k (0-8, default 4): Number of hotspot top-level directories to include.\n" +
-    "- hotspot_tree_depth (1-4, default 2): Tree depth for each hotspot subtree.\n" +
-    "- hotspot_max_bytes (16384-262144, default 122880): Repo-map byte budget in bootstrap_hotspot mode.\n" +
-    "- bootstrap_enabled (default true): Enable standalone bootstrap phase for hotspot hint collection.\n" +
-    "- bootstrap_max_turns (1-3, default 2): Bootstrap phase turns.\n" +
-    "- bootstrap_max_commands (1-8, default 6): Bootstrap commands per turn.\n" +
-    "The response includes [config] and [diagnostic] lines — read them to decide if you should retry with different parameters.",
-});
-
-// ─── Tool: fast_context_search ─────────────────────────────
-
-server.tool(
-  "fast_context_search",
-  "AI-driven semantic code search using Windsurf's Devstral model. " +
-  "Searches a codebase with natural language and returns relevant file paths with line ranges, " +
-  "plus suggested grep keywords for follow-up searches.\n" +
-  "Parameter tuning guide:\n" +
-  "- tree_depth: Controls how much directory structure the remote AI sees before searching. " +
-  "If you get a payload/size error, REDUCE this value. " +
-  "If search results are too shallow (missing files in deep subdirectories), INCREASE this value. " +
-  "Use 0 for auto depth based on project size.\n" +
-  "- max_turns: Controls how many search-execute-feedback rounds the remote AI gets. " +
-  "If results are incomplete or the AI didn't find enough files, INCREASE this value. " +
-  "If you want a quick rough answer, use 1.\n" +
-  (FC_SNIPPETS_EXPLICITLY_SET
-    ? `- include_code_snippets: Server-configured default is ${DEFAULT_INCLUDE_SNIPPETS}. Do NOT override unless explicitly asked by the user.\n`
-    : "- include_code_snippets: Default false (lightweight mode, ~2-5KB output). " +
-    "Set to true to include full code snippets in the response (~45KB output).\n") +
-  "Response includes a [config] line showing actual parameters used \u2014 use this to decide adjustments on retry.",
-  {
+  const schema = {
     query: z.string().describe(
       'Natural language search query (e.g. "where is auth handled", "database connection pool")'
     ),
@@ -144,7 +121,7 @@ server.tool(
       .int()
       .min(1)
       .max(5)
-      .default(MAX_TURNS)
+      .default(config.maxTurns)
       .describe(
         "Number of search rounds. Each round: remote AI generates search commands → local execution → results sent back. " +
         "Default 3. Use 1 for quick simple lookups. Use 4-5 for complex queries requiring deep tracing across many files. " +
@@ -169,112 +146,53 @@ server.tool(
         "Useful for reducing payload size on large repos. " +
         "Examples: ['node_modules', 'dist', '.git', 'build', 'coverage', '*.min.*']"
       ),
-    repo_map_mode: z
-      .enum(["classic", "bootstrap_hotspot"])
-      .default(DEFAULT_REPO_MAP_MODE)
-      .describe(
-        "Repo map strategy. classic = single tree map. bootstrap_hotspot = bootstrap mini-tree + query-scored hotspot subtrees."
-      ),
-    bootstrap_tree_depth: z
-      .number()
-      .int()
-      .min(1)
-      .max(3)
-      .default(DEFAULT_BOOTSTRAP_TREE_DEPTH)
-      .describe("Bootstrap tree depth used when repo_map_mode=bootstrap_hotspot."),
-    hotspot_top_k: z
-      .number()
-      .int()
-      .min(0)
-      .max(8)
-      .default(DEFAULT_HOTSPOT_TOP_K)
-      .describe("Maximum number of hotspot top-level directories to append in repo map."),
-    hotspot_tree_depth: z
-      .number()
-      .int()
-      .min(1)
-      .max(4)
-      .default(DEFAULT_HOTSPOT_TREE_DEPTH)
-      .describe("Tree depth for each hotspot subtree in repo map."),
-    hotspot_max_bytes: z
-      .number()
-      .int()
-      .min(16384)
-      .max(262144)
-      .default(DEFAULT_HOTSPOT_MAX_BYTES)
-      .describe("Maximum bytes budget for optimized repo map output."),
-    bootstrap_enabled: z
-      .boolean()
-      .default(DEFAULT_BOOTSTRAP_ENABLED)
-      .describe("Enable standalone bootstrap phase before main search phase."),
-    bootstrap_max_turns: z
-      .number()
-      .int()
-      .min(1)
-      .max(3)
-      .default(DEFAULT_BOOTSTRAP_MAX_TURNS)
-      .describe("Max turns for bootstrap phase (independent from main max_turns)."),
-    bootstrap_max_commands: z
-      .number()
-      .int()
-      .min(1)
-      .max(8)
-      .default(DEFAULT_BOOTSTRAP_MAX_COMMANDS)
-      .describe("Max commands per turn for bootstrap phase."),
     include_code_snippets: z
       .boolean()
-      .default(DEFAULT_INCLUDE_SNIPPETS)
+      .default(config.includeSnippets)
       .describe(
-        FC_SNIPPETS_EXPLICITLY_SET
+        config.includeSnippetsExplicitlySet
           ? `Include full code snippets in the response. ` +
-          `Server default: ${DEFAULT_INCLUDE_SNIPPETS} (configured via FC_INCLUDE_SNIPPETS env var). ` +
+          `Server default: ${config.includeSnippets} (configured via FC_INCLUDE_SNIPPETS env var). ` +
           `Do NOT override this value unless the user explicitly asks for a different mode.`
           : `Include full code snippets in the response. ` +
           `Default false (lightweight mode: file paths + line ranges + grep keywords, ~2-5KB output). ` +
           `Set to true for full code context (~45KB output).`
       ),
-  },
-  async ({
+  };
+
+  const handler = async ({
     query,
     project_path,
     tree_depth,
     max_turns,
     max_results,
     exclude_paths,
-    repo_map_mode,
-    bootstrap_tree_depth,
-    hotspot_top_k,
-    hotspot_tree_depth,
-    hotspot_max_bytes,
-    bootstrap_enabled,
-    bootstrap_max_turns,
-    bootstrap_max_commands,
     include_code_snippets,
   }) => {
     const projectPath = project_path;
-    const validationError = validateProjectPath(projectPath);
+    const validationError = validatePath(projectPath);
     if (validationError) {
       return { content: [{ type: "text", text: validationError }] };
     }
 
     try {
-      const result = await searchWithContent({
+      const result = await runSearchWithContent({
         query,
         projectRoot: projectPath,
         maxTurns: max_turns,
-        maxCommands: MAX_COMMANDS,
+        maxCommands: config.maxCommands,
         maxResults: max_results,
         treeDepth: tree_depth,
-        timeoutMs: TIMEOUT_MS,
+        timeoutMs: config.timeoutMs,
         excludePaths: exclude_paths,
-        repoMapMode: repo_map_mode,
-        bootstrapTreeDepth: bootstrap_tree_depth,
-        hotspotTopK: hotspot_top_k,
-        hotspotTreeDepth: hotspot_tree_depth,
-        hotspotMaxBytes: hotspot_max_bytes,
-        bootstrapEnabled: bootstrap_enabled,
-        bootstrapMaxTurns: bootstrap_max_turns,
-        bootstrapMaxCommands: bootstrap_max_commands,
+        repoMapMode: config.repoMapMode,
+        bootstrapTreeDepth: config.bootstrapTreeDepth,
+        hotspotTopK: config.hotspotTopK,
+        hotspotTreeDepth: config.hotspotTreeDepth,
+        hotspotMaxBytes: config.hotspotMaxBytes,
+        bootstrapEnabled: config.bootstrapEnabled,
+        bootstrapMaxTurns: config.bootstrapMaxTurns,
+        bootstrapMaxCommands: config.bootstrapMaxCommands,
         includeSnippets: include_code_snippets,
       });
       return { content: [{ type: "text", text: result }] };
@@ -292,46 +210,91 @@ server.tool(
         }]
       };
     }
-  }
-);
+  };
 
-// ─── Tool: extract_windsurf_key ────────────────────────────
+  return {
+    name: "fast_context_search",
+    description,
+    schema,
+    handler,
+  };
+}
 
-server.tool(
-  "extract_windsurf_key",
-  "Extract Windsurf API Key from local installation. " +
-  "Auto-detects OS (macOS/Windows/Linux) and reads the API key from " +
-  "Windsurf's local database. Set the result as WINDSURF_API_KEY env var.",
-  {},
-  async () => {
-    const result = await extractKeyInfo();
+export function buildExtractWindsurfKeyTool({ deps = {} } = {}) {
+  const getExtractKeyInfo = deps.extractKeyInfo || extractKeyInfo;
 
-    if (result.error) {
-      const text = `Error: ${result.error}\n${result.hint || ""}\nDB path: ${result.db_path || "N/A"}`;
+  return {
+    name: "extract_windsurf_key",
+    description:
+      "Extract Windsurf API Key from local installation. " +
+      "Auto-detects OS (macOS/Windows/Linux) and reads the API key from " +
+      "Windsurf's local database. Set the result as WINDSURF_API_KEY env var.",
+    schema: {},
+    handler: async () => {
+      const result = await getExtractKeyInfo();
+
+      if (result.error) {
+        const text = `Error: ${result.error}\n${result.hint || ""}\nDB path: ${result.db_path || "N/A"}`;
+        return { content: [{ type: "text", text }] };
+      }
+
+      const key = result.api_key;
+      const text =
+        `Windsurf API Key extracted successfully\n\n` +
+        `  Key: ${key.slice(0, 30)}...${key.slice(-10)}\n` +
+        `  Length: ${key.length}\n` +
+        `  Source: ${result.db_path}\n\n` +
+        `Usage:\n` +
+        `  export WINDSURF_API_KEY="${key}"`;
+
       return { content: [{ type: "text", text }] };
-    }
+    },
+  };
+}
 
-    const key = result.api_key;
-    const text =
-      `Windsurf API Key extracted successfully\n\n` +
-      `  Key: ${key.slice(0, 30)}...${key.slice(-10)}\n` +
-      `  Length: ${key.length}\n` +
-      `  Source: ${result.db_path}\n\n` +
-      `Usage:\n` +
-      `  export WINDSURF_API_KEY="${key}"`;
+export function createServer({
+  config = readRuntimeConfig(),
+  deps = {},
+} = {}) {
+  const server = new McpServer({
+    name: "windsurf-fast-context",
+    version: SERVER_VERSION,
+    instructions:
+      "Windsurf Fast Context — AI-driven semantic code search. " +
+      "Returns file paths with line ranges, grep keywords, and diagnostic [config] lines. " +
+      "Retry with lower tree_depth/max_turns or add exclude_paths when payload, timeout, or noisy-result issues occur.",
+  });
 
-    return { content: [{ type: "text", text }] };
-  }
-);
+  const fastContextTool = buildFastContextSearchTool({ config, deps });
+  server.tool(
+    fastContextTool.name,
+    fastContextTool.description,
+    fastContextTool.schema,
+    fastContextTool.handler,
+  );
+
+  const extractKeyTool = buildExtractWindsurfKeyTool({ deps });
+  server.tool(
+    extractKeyTool.name,
+    extractKeyTool.description,
+    extractKeyTool.schema,
+    extractKeyTool.handler,
+  );
+
+  return server;
+}
 
 // ─── Start ─────────────────────────────────────────────────
 
 async function main() {
   const transport = new StdioServerTransport();
+  const server = createServer();
   await server.connect(transport);
 }
 
-main().catch((err) => {
-  console.error("Fatal error:", err);
-  process.exit(1);
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((err) => {
+    console.error("Fatal error:", err);
+    process.exit(1);
+  });
+}

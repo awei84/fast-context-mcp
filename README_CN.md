@@ -140,6 +140,15 @@ Key 存储在 Windsurf 的本地 SQLite 数据库中：
 | `FC_TIMEOUT_MS` | `30000` | 流式请求连接超时（毫秒） |
 | `FC_RESULT_MAX_LINES` | `50` | 每条命令输出的最大行数（截断） |
 | `FC_LINE_MAX_CHARS` | `250` | 每行输出的最大字符数（截断） |
+| `FC_INCLUDE_SNIPPETS` | `false` | 是否默认随搜索结果返回代码片段 |
+| `FC_REPO_MAP_MODE` | `bootstrap_hotspot` | Repo map 构建策略（`bootstrap_hotspot` 或 `classic`） |
+| `FC_BOOTSTRAP_ENABLED` | `true` | 是否启用独立 bootstrap 阶段来发现热点目录 |
+| `FC_BOOTSTRAP_TREE_DEPTH` | `1` | bootstrap repo map 的目录深度（1-3） |
+| `FC_BOOTSTRAP_MAX_TURNS` | `2` | bootstrap 阶段搜索轮数（1-3） |
+| `FC_BOOTSTRAP_MAX_COMMANDS` | `6` | bootstrap 每轮最大命令数（1-8） |
+| `FC_HOTSPOT_TOP_K` | `4` | 追加的热点顶层目录数量（0-8） |
+| `FC_HOTSPOT_TREE_DEPTH` | `2` | 每个热点子树的目录深度（1-4） |
+| `FC_HOTSPOT_MAX_BYTES` | `122880` | 优化后 repo map 的字节预算 |
 | `WS_MODEL` | `MODEL_SWE_1_6_FAST` | Windsurf 模型名称 |
 | `WS_APP_VER` | `1.48.2` | Windsurf 应用版本（协议元数据） |
 | `WS_LS_VER` | `1.9544.35` | Windsurf 语言服务器版本（协议元数据） |
@@ -162,9 +171,11 @@ Key 存储在 Windsurf 的本地 SQLite 数据库中：
 |------|------|------|--------|------|
 | `query` | string | 是 | — | 自然语言搜索查询 |
 | `project_path` | string | **是** | — | 项目根目录的绝对路径 |
-| `tree_depth` | integer | 否 | `3` | 仓库目录树深度（1-6）。越深上下文越丰富，但 payload 越大。超过 250KB 会自动降级。超大 monorepo（>5000 文件）用 1-2，普通项目用 3，小项目用 4-6。 |
+| `tree_depth` | integer | 否 | `3` | 仓库目录树深度（0-6，0 = 自动）。越深上下文越丰富，但 payload 越大。超过 250KB 会自动降级。超大 monorepo（>5000 文件）用 1-2，普通项目用 3，小项目用 4-6。 |
 | `max_turns` | integer | 否 | `3` | 搜索轮数（1-5）。越多越深入，但越慢。简单查找用 1-2，一般查询用 3，复杂分析用 4-5。 |
 | `max_results` | integer | 否 | `10` | 最多返回的文件数（1-30）。越小越聚焦，越大覆盖越广。 |
+| `exclude_paths` | string[] | 否 | `[]` | 从 repo map 和搜索上下文中排除的目录/文件模式。适合大仓库或过滤生成文件噪声。 |
+| `include_code_snippets` | boolean | 否 | `false` | 是否在返回结果中包含代码片段。默认只返回文件路径、行号范围和 grep 关键词。 |
 
 返回：
 1. **相关文件**及行号范围
