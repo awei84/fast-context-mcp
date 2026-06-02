@@ -165,11 +165,11 @@ Default: `MODEL_SWE_1_6_FAST` — fastest speed, richest grep keywords, finest l
 
 ### `fast_context_search`
 
-AI-driven semantic code search with tunable parameters.
+AI-driven semantic code search with tunable parameters. For best semantic search quality, write queries primarily in English; add local-language business terms only when useful.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| `query` | string | Yes | — | Natural language search query |
+| `query` | string | Yes | — | Natural language search query. English is recommended for best semantic matching; add local-language business terms when useful. |
 | `project_path` | string | **Yes** | — | Absolute path to project root directory |
 | `tree_depth` | integer | No | `3` | Directory tree depth for repo map (0-6, 0 = auto). Higher = more context but larger payload. Auto falls back to lower depth if tree exceeds 250KB. Use 1-2 for huge monorepos (>5000 files), 3 for most projects, 4-6 for small projects. |
 | `max_turns` | integer | No | `3` | Search rounds (1-5). More = deeper search but slower. Use 1-2 for simple lookups, 3 for most queries, 4-5 for complex analysis. |

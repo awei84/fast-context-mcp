@@ -60,6 +60,15 @@ describe("fast_context_search tool schema", () => {
     assert.equal(tool.schema.include_code_snippets._def.defaultValue(), true);
     assert.match(tool.description, /Server-configured default is true/);
   });
+
+  it("recommends English queries for semantic search quality", () => {
+    const tool = buildFastContextSearchTool({
+      config: readRuntimeConfig({}),
+    });
+
+    assert.match(tool.description, /primarily in English/);
+    assert.match(tool.schema.query.description, /English is recommended/);
+  });
 });
 
 describe("fast_context_search handler", () => {

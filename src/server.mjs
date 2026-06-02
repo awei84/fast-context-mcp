@@ -88,6 +88,7 @@ export function buildFastContextSearchTool({
     "AI-driven semantic code search using Windsurf's Devstral model. " +
     "Searches a codebase with natural language and returns relevant file paths with line ranges, " +
     "plus suggested grep keywords for follow-up searches.\n" +
+    "For best semantic search quality, write the query primarily in English; add local-language business terms only when needed.\n" +
     "Use tree_depth/max_turns/max_results for task-level tuning; use exclude_paths to reduce payload or noise.\n" +
     (config.includeSnippetsExplicitlySet
       ? `- include_code_snippets: Server-configured default is ${config.includeSnippets}. Do NOT override unless explicitly asked by the user.\n`
@@ -97,7 +98,7 @@ export function buildFastContextSearchTool({
 
   const schema = {
     query: z.string().describe(
-      'Natural language search query (e.g. "where is auth handled", "database connection pool")'
+      'Natural language search query. English is recommended for best semantic matching; add local-language business terms when useful (e.g. "where is user login authentication and JWT validation handled 登录鉴权", "database connection pool")'
     ),
     project_path: projectPathSchema.describe(
       "Absolute path to project root directory (required). " +
