@@ -4,7 +4,7 @@
 
 AI-driven semantic code search as an MCP tool — powered by Windsurf's reverse-engineered SWE-grep protocol.
 
-Any MCP-compatible client (Claude Code, Claude Desktop, Cursor, etc.) can use this to search codebases with natural language queries. All tools are bundled via npm — **no system-level dependencies** needed (ripgrep via `@vscode/ripgrep`, tree via `tree-node-cli`). Works on macOS, Windows, and Linux.
+Any MCP-compatible client (Claude Code, Claude Desktop, Cursor, etc.) can use this to search codebases with natural language queries. All tools are bundled via npm — **no system-level dependencies** needed (ripgrep via `@vscode/ripgrep`, tree via Node.js `fs`). Works on macOS, Windows, and Linux.
 
 ## How It Works
 
@@ -245,7 +245,7 @@ fast-context-mcp/
 
 - **Protocol**: Connect-RPC over HTTP/1.1, Protobuf encoding, gzip compression
 - **Model**: Devstral (`MODEL_SWE_1_6_FAST`, configurable)
-- **Local tools**: `rg` (bundled via @vscode/ripgrep), `readfile` (Node.js fs), `tree` (tree-node-cli), `ls` (Node.js fs), `glob` (Node.js fs)
+- **Local tools**: `rg` (bundled via @vscode/ripgrep), `readfile` (Node.js fs), `tree` (Node.js fs), `ls` (Node.js fs), `glob` (Node.js fs)
 - **Auth**: API Key → JWT (auto-fetched per session)
 - **Runtime**: Node.js >= 18 (ESM)
 
@@ -255,7 +255,6 @@ fast-context-mcp/
 |---------|---------|
 | `@modelcontextprotocol/sdk` | MCP server framework |
 | `@vscode/ripgrep` | Bundled ripgrep binary (cross-platform) |
-| `tree-node-cli` | Cross-platform directory tree (replaces system `tree`) |
 | `sql.js` | Read Windsurf's local SQLite DB |
 | `zod` | Schema validation (MCP SDK requirement) |
 

@@ -17,7 +17,6 @@ import { execFileSync } from "node:child_process";
 import { gzipSync } from "node:zlib";
 import { randomUUID } from "node:crypto";
 import { platform, arch, release, version as osVersion, hostname, cpus, totalmem } from "node:os";
-import treeNodeCli from "tree-node-cli";
 
 import {
   ProtobufEncoder,
@@ -26,6 +25,7 @@ import {
   connectFrameDecode,
 } from "./protobuf.mjs";
 import { ToolExecutor } from "./executor.mjs";
+import { renderTree } from "./tree.mjs";
 import { rgPath } from "@vscode/ripgrep";
 import { extractKey } from "./extract-key.mjs";
 import { scoreDirectories, tokenize as tokenizeBM25 } from "./directory-scorer.mjs";
@@ -1223,7 +1223,7 @@ const MAX_TREE_BYTES = 250 * 1024;
 
 /**
  * Convert an exclude pattern (directory/file name or simple glob) to RegExp
- * for tree-node-cli's exclude option.
+ * for tree rendering exclude matching.
  * @param {string} pattern - e.g. "node_modules", "dist", "*.min.*"
  * @returns {RegExp}
  */
@@ -1307,7 +1307,7 @@ function getRepoMap(projectRoot, targetDepth = 3, excludePaths = []) {
     try {
       const opts = { maxDepth: L };
       if (excludeRegexes.length) opts.exclude = excludeRegexes;
-      const stdout = treeNodeCli(projectRoot, opts);
+      const stdout = renderTree(projectRoot, opts);
       // Normalize root to /codebase consistently.
       let treeStr = _normalizeTreeRoot(stdout, projectRoot, "/codebase");
       const sizeBytes = Buffer.byteLength(treeStr, "utf-8");
@@ -1385,7 +1385,7 @@ function _buildSubtreeForDir(projectRoot, dir, levels = 2) {
   const abs = join(projectRoot, dir);
   const vRoot = `/codebase/${dir}`;
   try {
-    const stdout = treeNodeCli(abs, { maxDepth: levels });
+    const stdout = renderTree(abs, { maxDepth: levels });
     return _normalizeTreeRoot(stdout, abs, vRoot);
   } catch {
     return `${vRoot}\n  (failed to generate subtree)`;
@@ -2190,17 +2190,22 @@ export async function searchWithContent({
       : (entry.fromGrep ? "grep match" : "");
     const label = entry.fromGrep ? " [grep expanded]" : "";
 
+    if (!includeSnippets) {
+      parts.push(`  [${i + 1}/${n}] ${entry.full_path} (${rangesStr})${label}`);
+      continue;
+    }
+
     parts.push("");
     parts.push(`--- [${i + 1}/${n}] ${entry.full_path} (${rangesStr})${label} ---`);
 
     // 仅在 includeSnippets=true 时读取并附带代码片段
-    if (includeSnippets && codeBudgetLeft > 200) {
+    if (codeBudgetLeft > 200) {
       const { snippets, used } = _readCodeSnippets(entry.full_path, entry.ranges, codeBudgetLeft);
       for (const s of snippets) {
         parts.push(s);
       }
       codeBudgetLeft -= used;
-    } else if (includeSnippets) {
+    } else {
       parts.push("(code snippet omitted — output budget reached)");
     }
   }

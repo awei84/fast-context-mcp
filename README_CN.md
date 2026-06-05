@@ -4,7 +4,7 @@
 
 基于 Windsurf 逆向工程 SWE-grep 协议的 AI 语义代码搜索 MCP 工具。
 
-任何兼容 MCP 的客户端（Claude Code、Claude Desktop、Cursor 等）均可通过自然语言查询搜索代码库。所有依赖通过 npm 打包，**无需安装系统级依赖**（ripgrep 由 `@vscode/ripgrep` 提供，tree 由 `tree-node-cli` 提供）。支持 macOS、Windows 和 Linux。
+任何兼容 MCP 的客户端（Claude Code、Claude Desktop、Cursor 等）均可通过自然语言查询搜索代码库。所有依赖通过 npm 打包，**无需安装系统级依赖**（ripgrep 由 `@vscode/ripgrep` 提供，tree 由 Node.js `fs` 提供）。支持 macOS、Windows 和 Linux。
 
 ## 工作原理
 
@@ -246,7 +246,7 @@ fast-context-mcp/
 
 - **协议**：Connect-RPC over HTTP/1.1，Protobuf 编码，gzip 压缩
 - **模型**：Devstral（`MODEL_SWE_1_6_FAST`，可配置）
-- **本地工具**：`rg`（via @vscode/ripgrep）、`readfile`（Node.js fs）、`tree`（tree-node-cli）、`ls`（Node.js fs）、`glob`（Node.js fs）
+- **本地工具**：`rg`（via @vscode/ripgrep）、`readfile`（Node.js fs）、`tree`（Node.js fs）、`ls`（Node.js fs）、`glob`（Node.js fs）
 - **认证**：API Key → JWT（每次会话自动获取）
 - **运行时**：Node.js >= 18（ESM）
 
@@ -256,7 +256,6 @@ fast-context-mcp/
 |----|------|
 | `@modelcontextprotocol/sdk` | MCP 服务器框架 |
 | `@vscode/ripgrep` | 内置跨平台 ripgrep |
-| `tree-node-cli` | 跨平台目录树（替代系统 `tree`） |
 | `sql.js` | 读取 Windsurf 本地 SQLite 数据库 |
 | `zod` | Schema 校验（MCP SDK 依赖） |
 

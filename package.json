@@ -1,6 +1,6 @@
 {
   "name": "fast-context-mcp",
-  "version": "1.4.3",
+  "version": "1.5.0",
   "description": "AI-driven semantic code search MCP server (Node.js)",
   "type": "module",
   "main": "src/server.mjs",
@@ -26,7 +26,6 @@
     "@vscode/ripgrep": "^1.15.9",
     "scule": "^1.3.0",
     "sql.js": "^1.14.0",
-    "tree-node-cli": "^1.6.0",
     "zod": "^3.23.0"
   },
   "license": "MIT"

@@ -10,7 +10,7 @@ import { readdirSync, readFileSync, statSync, existsSync } from "node:fs";
 import { join, resolve, relative, sep, basename, isAbsolute } from "node:path";
 import { promisify } from "node:util";
 import { rgPath } from "@vscode/ripgrep";
-import treeNodeCli from "tree-node-cli";
+import { renderTree } from "./tree.mjs";
 
 const execFileAsync = promisify(execFileCb);
 
@@ -336,11 +336,11 @@ export class ToolExecutor {
     try {
       const opts = {};
       if (levels) opts.maxDepth = levels;
-      let stdout = treeNodeCli(rp, opts);
+      let stdout = renderTree(rp, opts);
       // Two-step normalization:
       // 1. _remap: replace absolute project root with /codebase globally
       stdout = this._remap(stdout);
-      // 2. Handle basename root line: tree-node-cli outputs the directory
+      // 2. Handle basename root line: renderTree outputs the directory
       //    basename as the first line (e.g. "supabase"), which _remap won't
       //    catch since it's not the full absolute path. Replace with the
       //    virtual path the AI requested (already /codebase/...).
