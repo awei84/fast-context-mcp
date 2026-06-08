@@ -1,7 +1,15 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { mkdirSync, mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
-import { isAcceptableApiKey, looksTruncated } from "../src/core.mjs";
+import {
+  formatNoRelevantFilesFound,
+  isAcceptableApiKey,
+  looksTruncated,
+  selectNoResultRetryProjectRoots,
+} from "../src/core.mjs";
 
 describe("isAcceptableApiKey", () => {
   it("accepts the legacy sk-ws- key format", () => {
@@ -54,5 +62,64 @@ describe("looksTruncated", () => {
     assert.equal(looksTruncated("some-other-token"), false);
     assert.equal(looksTruncated(""), false);
     assert.equal(looksTruncated(null), false);
+  });
+});
+
+describe("formatNoRelevantFilesFound", () => {
+  it("keeps raw response diagnostics and suggests narrowing large repos", () => {
+    const text = formatNoRelevantFilesFound({
+      rawResponse: "x".repeat(700),
+      meta: {
+        treeDepth: 1,
+        hotspotDepth: 2,
+        treeSizeKB: 118.4,
+        fellBack: true,
+        repoMapStrategy: "bootstrap_hotspot",
+        hotDirs: ["backend", "docs"],
+      },
+      projectRoot: "/repo",
+      treeDepth: 3,
+      maxTurns: 2,
+      maxResults: 8,
+      timeoutMs: 30000,
+      excludePaths: ["dist"],
+    });
+
+    assert.match(text, /No relevant files found/);
+    assert.match(text, /raw_response_truncated=true, raw_response_chars=700/);
+    assert.match(text, /tree_depth_used=1 \(fell back from requested depth\), hotspot_depth=2/);
+    assert.match(text, /hot_dirs=\[backend, docs\]/);
+    assert.match(text, /project_path=\/repo, requested_tree_depth=3/);
+    assert.match(text, /exclude_paths=\[dist\]/);
+    assert.match(text, /narrow project_path to a likely source subtree/);
+    assert.match(text, /backend, server, src, app/);
+    assert.match(text, /ent/);
+  });
+});
+
+describe("selectNoResultRetryProjectRoots", () => {
+  it("uses hot_dirs first and limits retries to existing safe subdirectories", () => {
+    const root = mkdtempSync(join(tmpdir(), "fc-retry-roots-"));
+    mkdirSync(join(root, "backend"));
+    mkdirSync(join(root, "src"));
+    mkdirSync(join(root, "docs"));
+
+    const roots = selectNoResultRetryProjectRoots(root, {
+      hotDirs: ["docs", "../outside", "backend", "missing"],
+    }, 2);
+
+    assert.deepEqual(roots, [
+      join(root, "docs"),
+      join(root, "backend"),
+    ]);
+  });
+
+  it("falls back to common source directories", () => {
+    const root = mkdtempSync(join(tmpdir(), "fc-retry-roots-"));
+    mkdirSync(join(root, "src"));
+
+    assert.deepEqual(selectNoResultRetryProjectRoots(root, null, 2), [
+      join(root, "src"),
+    ]);
   });
 });

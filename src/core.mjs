@@ -118,6 +118,26 @@ const DEFAULT_EXCLUDE_PATHS = [
   ".vscode",
 ];
 
+const LARGE_REPO_HINT_EXCLUDES = [
+  "node_modules",
+  "dist",
+  "build",
+  "vendor",
+  "coverage",
+  "ent",
+  "generated",
+];
+
+const NO_RESULT_RETRY_DIRS = [
+  "backend",
+  "server",
+  "src",
+  "app",
+  "packages",
+  "services",
+  "internal",
+];
+
 // Repo-map optimization defaults (tunable via MCP params).
 const REPO_MAP_OPTIMIZER_DEFAULTS = {
   mode: "bootstrap_hotspot", // classic | bootstrap_hotspot
@@ -1749,7 +1769,19 @@ export async function search({
       if (thinking.startsWith("[Error]")) {
         return { files: [], error: thinking };
       }
-      return { files: [], raw_response: thinking };
+      return {
+        files: [],
+        raw_response: thinking,
+        _meta: {
+          treeDepth: actualDepth,
+          hotspotDepth: actualHotspotDepth,
+          treeSizeKB: +(treeSizeBytes / 1024).toFixed(1),
+          fellBack,
+          projectRoot,
+          repoMapStrategy,
+          hotDirs,
+        },
+      };
     }
 
     const [toolName, toolArgs] = toolInfo;
@@ -2052,6 +2084,114 @@ function _readCodeSnippets(filePath, ranges, budget) {
 }
 
 /**
+ * 格式化无结果响应，保留真实 raw response，同时给出可执行的缩小范围建议。
+ * @param {Object} opts
+ * @returns {string}
+ */
+export function formatNoRelevantFilesFound({
+  rawResponse = "",
+  meta = null,
+  projectRoot = "",
+  treeDepth = 3,
+  maxTurns = 3,
+  maxResults = 10,
+  timeoutMs = 30000,
+  excludePaths = [],
+  retryNotes = [],
+} = {}) {
+  const parts = ["No relevant files found."];
+  const raw = String(rawResponse || "");
+
+  if (raw) {
+    const MAX_RAW = 500;
+    const truncated = raw.length > MAX_RAW
+      ? raw.slice(0, MAX_RAW) + "\n...[raw_response truncated]..."
+      : raw;
+    parts.push("", `Raw response:\n${truncated}`);
+    if (raw.length > MAX_RAW) {
+      parts.push(`[diagnostic] raw_response_truncated=true, raw_response_chars=${raw.length}`);
+    }
+  } else {
+    parts.push("[diagnostic] raw_response_empty=true");
+  }
+
+  if (meta) {
+    const fbNote = meta.fellBack ? " (fell back from requested depth)" : "";
+    const hotspotNote = meta.hotspotDepth ? `, hotspot_depth=${meta.hotspotDepth}` : "";
+    const strategyNote = meta.repoMapStrategy ? `, strategy=${meta.repoMapStrategy}` : "";
+    parts.push(
+      `[diagnostic] tree_depth_used=${meta.treeDepth}${fbNote}${hotspotNote}, tree_size=${meta.treeSizeKB}KB${strategyNote}`,
+    );
+    if (Array.isArray(meta.hotDirs) && meta.hotDirs.length) {
+      parts.push(`[diagnostic] hot_dirs=[${meta.hotDirs.join(", ")}]`);
+    }
+  }
+
+  let configLine = `[config] project_path=${projectRoot}, requested_tree_depth=${treeDepth}, max_turns=${maxTurns}, max_results=${maxResults}, timeout_ms=${timeoutMs}`;
+  if (excludePaths.length) configLine += `, exclude_paths=[${excludePaths.join(", ")}]`;
+  parts.push(configLine);
+
+  for (const note of retryNotes) {
+    parts.push(note);
+  }
+
+  parts.push(
+    `[hint] The remote model returned no parseable file paths. For large or noisy repos, narrow project_path to a likely source subtree such as backend, server, src, app, or packages/<name>.`,
+  );
+  parts.push(
+    `[hint] Also add exclude_paths for generated/noisy directories when present, e.g. [${LARGE_REPO_HINT_EXCLUDES.join(", ")}].`,
+  );
+  parts.push(
+    `[hint] After Fast-Context returns candidates, verify them with rg/readfile and concrete path:line evidence.`,
+  );
+
+  return parts.join("\n");
+}
+
+function _safeExistingDir(root, dirName) {
+  if (typeof dirName !== "string" || !dirName) return null;
+  if (dirName.includes("..") || isAbsolute(dirName) || dirName.includes("/") || dirName.includes("\\")) {
+    return null;
+  }
+  const abs = resolve(root, dirName);
+  const rel = relative(root, abs);
+  if (rel.startsWith("..") || isAbsolute(rel)) return null;
+  try {
+    if (statSync(abs).isDirectory()) return abs;
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+/**
+ * 根据初次搜索的 hot_dirs 和常见源码目录，选择无结果时的有限重试范围。
+ * @param {string} projectRoot
+ * @param {Object|null} meta
+ * @param {number} maxRetries
+ * @returns {string[]}
+ */
+export function selectNoResultRetryProjectRoots(projectRoot, meta = null, maxRetries = 2) {
+  const root = resolve(projectRoot);
+  const ordered = [
+    ...(Array.isArray(meta?.hotDirs) ? meta.hotDirs : []),
+    ...NO_RESULT_RETRY_DIRS,
+  ];
+  const out = [];
+  const seen = new Set([root]);
+
+  for (const dirName of ordered) {
+    if (out.length >= maxRetries) break;
+    const abs = _safeExistingDir(root, dirName);
+    if (!abs || seen.has(abs)) continue;
+    seen.add(abs);
+    out.push(abs);
+  }
+
+  return out;
+}
+
+/**
  * Search and return formatted result suitable for MCP tool response.
  *
  * @param {Object} opts
@@ -2086,14 +2226,14 @@ export async function searchWithContent({
   bootstrapMaxCommands = 6,
   includeSnippets = false,
 }) {
-  const result = await search({
+  const runOnce = (root, depth) => search({
     query,
-    projectRoot,
+    projectRoot: root,
     apiKey,
     maxTurns,
     maxCommands,
     maxResults,
-    treeDepth,
+    treeDepth: depth,
     timeoutMs,
     excludePaths,
     repoMapMode,
@@ -2105,6 +2245,50 @@ export async function searchWithContent({
     bootstrapMaxTurns,
     bootstrapMaxCommands,
   });
+
+  const hasUniquePatterns = (r) => {
+    const patterns = r?.rg_patterns || [];
+    return [...new Set(patterns)].filter((p) => typeof p === "string" && p.length >= 3).length > 0;
+  };
+  const hasUsableResult = (r) => (r?.files || []).length > 0 || hasUniquePatterns(r);
+  const shouldRetryNoResult = (r) => (
+    !r?.error &&
+    !hasUsableResult(r) &&
+    typeof r?.raw_response === "string" &&
+    r.raw_response.length > 0
+  );
+
+  let result = await runOnce(projectRoot, treeDepth);
+  let activeProjectRoot = projectRoot;
+  const retryNotes = [];
+
+  if (shouldRetryNoResult(result)) {
+    const retryRoots = selectNoResultRetryProjectRoots(projectRoot, result._meta, 2);
+    if (retryRoots.length) {
+      const retryTreeDepth = Math.max(1, Math.min(Number(treeDepth) || 3, 2));
+      retryNotes.push(
+        `[retry] Initial search returned no parseable file paths; automatically retrying narrower project_path values.`,
+      );
+
+      for (const retryRoot of retryRoots) {
+        retryNotes.push(`[retry] tried project_path=${retryRoot}, tree_depth=${retryTreeDepth}`);
+        const retryResult = await runOnce(retryRoot, retryTreeDepth);
+        if (hasUsableResult(retryResult)) {
+          result = retryResult;
+          activeProjectRoot = retryRoot;
+          retryNotes.push(`[retry] recovered results from project_path=${retryRoot}`);
+          break;
+        }
+        if (retryResult.error) {
+          retryNotes.push(`[retry] project_path=${retryRoot} failed: ${retryResult.error}`);
+        } else {
+          retryNotes.push(`[retry] project_path=${retryRoot} returned no parseable files`);
+        }
+      }
+    } else {
+      retryNotes.push(`[retry] no existing likely source subdirectories found for automatic retry`);
+    }
+  }
 
   if (result.error) {
     const meta = result._meta;
@@ -2127,6 +2311,7 @@ export async function searchWithContent({
         errMsg += `\n[hint] If the error is payload-related, try a lower tree_depth value or add exclude_paths.`;
       }
     }
+    if (retryNotes.length) errMsg += `\n${retryNotes.join("\n")}`;
     return errMsg;
   }
 
@@ -2145,7 +2330,7 @@ export async function searchWithContent({
     const effectiveExcludePaths = _mergeExcludePaths(excludePaths);
     const extra = _autoGrepFiles(
       uniquePatterns,
-      projectRoot,
+      activeProjectRoot,
       effectiveExcludePaths,
       files.map((f) => f.path),
       3,
@@ -2158,14 +2343,23 @@ export async function searchWithContent({
   }
 
   if (!files.length && !uniquePatterns.length) {
-    const raw = result.raw_response || "";
-    if (!raw) return "No relevant files found.";
-    const MAX_RAW = 500;
-    const truncated = raw.length > MAX_RAW ? raw.slice(0, MAX_RAW) + "\n...[raw_response truncated]..." : raw;
-    return `No relevant files found.\n\nRaw response:\n${truncated}`;
+    return formatNoRelevantFilesFound({
+      rawResponse: result.raw_response || "",
+      meta: result._meta || null,
+      projectRoot: activeProjectRoot,
+      treeDepth,
+      maxTurns,
+      maxResults,
+      timeoutMs,
+      excludePaths,
+      retryNotes,
+    });
   }
 
   const parts = [];
+  if (retryNotes.length) {
+    parts.push(...retryNotes, "");
+  }
   const n = files.length;
 
   if (files.length) {
@@ -2221,7 +2415,7 @@ export async function searchWithContent({
     const fbNote = meta.fellBack ? ` (fell back from requested depth)` : "";
     parts.push("");
     const hotspotNote = meta.hotspotDepth ? `, hotspot_depth=${meta.hotspotDepth}` : "";
-    let configLine = `[config] project_path=${projectRoot}, tree_depth=${meta.treeDepth}${fbNote}${hotspotNote}, tree_size=${meta.treeSizeKB}KB, max_turns=${maxTurns}, max_results=${maxResults}, timeout_ms=${timeoutMs}`;
+    let configLine = `[config] project_path=${activeProjectRoot}, tree_depth=${meta.treeDepth}${fbNote}${hotspotNote}, tree_size=${meta.treeSizeKB}KB, max_turns=${maxTurns}, max_results=${maxResults}, timeout_ms=${timeoutMs}`;
     if (excludePaths.length) configLine += `, exclude_paths=[${excludePaths.join(", ")}]`;
     if (grepExpanded > 0) configLine += `, grep_expanded=${grepExpanded}`;
     parts.push(configLine);
