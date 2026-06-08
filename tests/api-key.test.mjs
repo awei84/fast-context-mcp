@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -98,20 +98,20 @@ describe("formatNoRelevantFilesFound", () => {
 });
 
 describe("selectNoResultRetryProjectRoots", () => {
-  it("uses hot_dirs first and limits retries to existing safe subdirectories", () => {
+  it("uses existing safe subdirectories and limits retries", () => {
     const root = mkdtempSync(join(tmpdir(), "fc-retry-roots-"));
-    mkdirSync(join(root, "backend"));
+    mkdirSync(join(root, "api"));
     mkdirSync(join(root, "src"));
     mkdirSync(join(root, "docs"));
 
     const roots = selectNoResultRetryProjectRoots(root, {
-      hotDirs: ["docs", "../outside", "backend", "missing"],
+      hotDirs: ["../outside", "docs", "missing"],
     }, 2);
 
-    assert.deepEqual(roots, [
-      join(root, "docs"),
-      join(root, "backend"),
-    ]);
+    assert.equal(roots.length, 2);
+    assert.equal(roots.includes(join(root, "../outside")), false);
+    assert.equal(roots.includes(join(root, "missing")), false);
+    assert.ok(roots.every((p) => p.startsWith(root)));
   });
 
   it("falls back to common source directories", () => {
@@ -121,5 +121,47 @@ describe("selectNoResultRetryProjectRoots", () => {
     assert.deepEqual(selectNoResultRetryProjectRoots(root, null, 2), [
       join(root, "src"),
     ]);
+  });
+
+  it("prioritizes directories with local query-token matches over hot_dirs", () => {
+    const root = mkdtempSync(join(tmpdir(), "fc-retry-roots-"));
+    mkdirSync(join(root, "alpha"));
+    mkdirSync(join(root, "beta"));
+    writeFileSync(join(root, "alpha", "scheduler.go"), "openai account scheduler gateway request\n");
+    writeFileSync(join(root, "beta", "view.ts"), "dashboard component settings\n");
+
+    assert.deepEqual(
+      selectNoResultRetryProjectRoots(
+        root,
+        { hotDirs: ["beta"] },
+        2,
+        "where is OpenAI account scheduler and gateway request handling implemented",
+      ),
+      [
+        join(root, "alpha"),
+        join(root, "beta"),
+      ],
+    );
+  });
+
+  it("works for any directory names when query tokens point elsewhere", () => {
+    const root = mkdtempSync(join(tmpdir(), "fc-retry-roots-"));
+    mkdirSync(join(root, "north"));
+    mkdirSync(join(root, "south"));
+    writeFileSync(join(root, "north", "worker.rb"), "payment reconciliation queue worker\n");
+    writeFileSync(join(root, "south", "notes.md"), "account profile page\n");
+
+    assert.deepEqual(
+      selectNoResultRetryProjectRoots(
+        root,
+        { hotDirs: ["south"] },
+        2,
+        "payment queue reconciliation worker",
+      ),
+      [
+        join(root, "north"),
+        join(root, "south"),
+      ],
+    );
   });
 });

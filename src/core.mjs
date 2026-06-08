@@ -128,14 +128,25 @@ const LARGE_REPO_HINT_EXCLUDES = [
   "generated",
 ];
 
-const NO_RESULT_RETRY_DIRS = [
-  "backend",
-  "server",
+const RETRY_QUERY_STOPWORDS = new Set([
+  "where", "what", "which", "when", "who", "why", "how", "does", "with",
+  "from", "into", "that", "this", "those", "these", "there", "their",
+  "implemented", "implementation", "handled", "handling", "used", "using",
+  "code", "file", "files", "logic", "find", "search",
+]);
+
+const RETRY_FALLBACK_DIR_HINTS = [
   "src",
   "app",
+  "lib",
   "packages",
+  "server",
+  "backend",
   "services",
   "internal",
+  "frontend",
+  "web",
+  "client",
 ];
 
 // Repo-map optimization defaults (tunable via MCP params).
@@ -2164,31 +2175,104 @@ function _safeExistingDir(root, dirName) {
   return null;
 }
 
+function _retryQueryTokens(query) {
+  return [...new Set(
+    String(query || "")
+      .toLowerCase()
+      .split(/[^a-z0-9_\-]+/)
+      .map((t) => t.trim())
+      .filter((t) => t.length >= 3 && !RETRY_QUERY_STOPWORDS.has(t))
+  )].slice(0, 8);
+}
+
+function _regexEscape(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function _probeRetryDirScore(absDir, tokens) {
+  if (!tokens.length) return 0;
+  const pattern = tokens.map(_regexEscape).join("|");
+  const args = [
+    "-l",
+    "--max-count", "20",
+    "-S",
+  ];
+  for (const ex of _mergeExcludePaths([])) {
+    for (const expanded of _expandExcludeGlobsForRg(ex)) {
+      args.push("--glob", `!${expanded}`);
+    }
+  }
+  args.push("--", pattern, absDir);
+
+  try {
+    const stdout = execFileSync(rgPath, args, {
+      timeout: 1500,
+      maxBuffer: 256 * 1024,
+      encoding: "utf-8",
+    });
+    return stdout.trim().split("\n").filter(Boolean).length;
+  } catch {
+    return 0;
+  }
+}
+
+function _scoreRetryCandidate(root, dirName, tokens, hotDirSet) {
+  const abs = _safeExistingDir(root, dirName);
+  if (!abs) return null;
+
+  const lowerName = dirName.toLowerCase();
+  const nameScore = tokens.reduce((score, token) => {
+    if (lowerName === token) return score + 4;
+    if (lowerName.includes(token) || token.includes(lowerName)) return score + 2;
+    return score;
+  }, 0);
+  const hintScore = RETRY_FALLBACK_DIR_HINTS.includes(lowerName) ? 1 : 0;
+  const hotScore = hotDirSet.has(dirName) ? 2 : 0;
+  const probeScore = _probeRetryDirScore(abs, tokens);
+
+  return {
+    dirName,
+    abs,
+    score: probeScore * 10 + nameScore + hotScore + hintScore,
+    probeScore,
+    hotScore,
+  };
+}
+
 /**
- * 根据初次搜索的 hot_dirs 和常见源码目录，选择无结果时的有限重试范围。
+ * 根据真实顶层目录、查询关键词本地命中和初次 hot_dirs，选择无结果时的有限重试范围。
  * @param {string} projectRoot
  * @param {Object|null} meta
  * @param {number} maxRetries
+ * @param {string} query
  * @returns {string[]}
  */
-export function selectNoResultRetryProjectRoots(projectRoot, meta = null, maxRetries = 2) {
+export function selectNoResultRetryProjectRoots(projectRoot, meta = null, maxRetries = 2, query = "") {
   const root = resolve(projectRoot);
-  const ordered = [
-    ...(Array.isArray(meta?.hotDirs) ? meta.hotDirs : []),
-    ...NO_RESULT_RETRY_DIRS,
-  ];
-  const out = [];
-  const seen = new Set([root]);
+  const hotDirs = Array.isArray(meta?.hotDirs) ? meta.hotDirs : [];
+  const hotDirSet = new Set(hotDirs);
+  const tokens = _retryQueryTokens(query);
+  const candidateNames = [...new Set([
+    ...hotDirs,
+    ..._listTopLevelDirs(root, _mergeExcludePaths([])),
+    ...RETRY_FALLBACK_DIR_HINTS,
+  ])];
 
-  for (const dirName of ordered) {
-    if (out.length >= maxRetries) break;
-    const abs = _safeExistingDir(root, dirName);
-    if (!abs || seen.has(abs)) continue;
-    seen.add(abs);
-    out.push(abs);
+  const candidates = [];
+  for (const dirName of candidateNames) {
+    const candidate = _scoreRetryCandidate(root, dirName, tokens, hotDirSet);
+    if (candidate) candidates.push(candidate);
   }
 
-  return out;
+  return candidates
+    .sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score;
+      if (b.probeScore !== a.probeScore) return b.probeScore - a.probeScore;
+      if (b.hotScore !== a.hotScore) return b.hotScore - a.hotScore;
+      return a.dirName.localeCompare(b.dirName);
+    })
+    .slice(0, maxRetries)
+    .map((c) => c.abs);
 }
 
 /**
@@ -2263,7 +2347,7 @@ export async function searchWithContent({
   const retryNotes = [];
 
   if (shouldRetryNoResult(result)) {
-    const retryRoots = selectNoResultRetryProjectRoots(projectRoot, result._meta, 2);
+    const retryRoots = selectNoResultRetryProjectRoots(projectRoot, result._meta, 2, query);
     if (retryRoots.length) {
       const retryTreeDepth = Math.max(1, Math.min(Number(treeDepth) || 3, 2));
       retryNotes.push(
